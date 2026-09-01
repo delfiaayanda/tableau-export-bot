@@ -5,7 +5,9 @@ date-stamped Excel file.
 
 **Status: in progress.** Authentication against the real Tableau server
 (`insight.erajaya.com`) is confirmed working (native username/password
-sign-in, REST API 3.29). Data extraction is still untested — network
+sign-in, REST API 3.29), and the view's GUID is confirmed
+(`741ce0df-8818-4412-93ca-b34c03019219` for workbook "Return & Rotate" /
+view "Dashboard 1"). Actual data extraction is still untested — network
 access to that host is blocked from the current development environment.
 See `CLAUDE.md` for details and what's left to verify.
 
@@ -15,11 +17,13 @@ See `CLAUDE.md` for details and what's left to verify.
 main.py                        CLI entry point
 auth_smoke_test.py             Isolated sign-in check (no data extraction)
 discover_view.py               Isolated workbook/view GUID lookup (no data extraction)
+extract_smoke_test.py          Isolated view-data probe (metadata only, no row data printed)
 src/exportbot/
   config.py                    Env-var configuration loading
   auth.py                      Authenticator interface + Tableau REST sign-in
   tableau_client.py            TableauClient interface + REST view-data fetch
   view_discovery.py            Resolves a workbook/view name pair to its GUID
+  extraction_probe.py          Probes view-data endpoint, reports shape metadata only
   validation.py                Pre-export data checks
   exporter.py                  Excel export (date folder + timestamped file)
   pipeline.py                  Wires the above together
@@ -73,6 +77,14 @@ python discover_view.py
 
 Prints `SUCCESS: workbook='...' (id=...) view='...' (id=...) -> set TABLEAU_VIEW_ID=...`
 or a sanitized `FAILURE: ...`.
+
+Once `TABLEAU_VIEW_ID` is set, probe actual data extraction from that view
+(reports only HTTP status, content type, row/column counts, and column
+names — never row values, credentials, or tokens):
+
+```bash
+python extract_smoke_test.py
+```
 
 ```bash
 python main.py

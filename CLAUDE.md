@@ -33,6 +33,12 @@ Layered, each layer swappable via a small interface:
   filtered by `contentUrl`, plus a follow-up `GET .../workbooks/{id}` for
   the workbook's display name. Standalone from the pipeline; not yet wired
   into `main.py`.
+- `extraction_probe.py` — `probe_view_data()`, an authenticated GET to the
+  exact same "view data" endpoint `tableau_client.py` uses, but returns
+  only shape metadata (HTTP status, content type, row/column counts,
+  column names) instead of the full DataFrame -- used by
+  `extract_smoke_test.py` to check extraction works before wiring it into
+  the real pipeline. Standalone; not yet wired into `main.py`.
 - `validation.py` — generic sanity checks on the DataFrame (not empty, has
   columns, not all-null) before export.
 - `exporter.py` — writes the DataFrame to
@@ -85,15 +91,27 @@ reported `SUCCESS: authenticated (api_version=3.29)`.** Sign-in against
 the real server is confirmed working. Credentials were never seen,
 logged, or committed in this process.
 
+**A user then ran `discover_view.py` from that same machine and it
+resolved the real workbook/view:**
+
+```
+workbook: Return & Rotate
+view: Dashboard 1
+view_id: 741ce0df-8818-4412-93ca-b34c03019219
+```
+
+`TABLEAU_VIEW_ID` is now known. This confirms the "Query Views for Site"
+endpoint (filtered by `contentUrl`) and the follow-up "Query Workbook"
+call both work against the real server.
+
 Still unverified (needs a machine with real access, i.e. not this
 sandbox):
 
-- Whether `discover_view()` (`view_discovery.py` / `discover_view.py`)
-  actually resolves `ReturnRotate`/`Dashboard1` to real GUIDs against the
-  live server. **Not yet run there — only mocked-response unit tests.**
-- Whether the "view data" endpoint returns the CSV shape assumed by
-  `tableau_client.py`, or whether crosstab/export endpoints work better.
-- End-to-end `python main.py` run with real credentials and a real
+- Whether the "view data" endpoint (`extraction_probe.py` /
+  `extract_smoke_test.py`, same endpoint as `tableau_client.py`) actually
+  returns data for this view, and in what shape (CSV, content type, row
+  count). **Not yet run there — only mocked-response unit tests.**
+- End-to-end `python main.py` run with real credentials and the real
   `TABLEAU_VIEW_ID`.
 
 `tableau_client.py` is written to match Tableau's documented REST API,
@@ -123,15 +141,21 @@ Tested in this environment (`pytest`, no network):
 - `discover_view.py` (CLI) — success/failure reporting, using mocked
   auth + view-lookup responses; confirms the auth token and credentials
   never appear in its output.
+- `extraction_probe.py` — `probe_view_data()`'s handling of CSV and
+  non-CSV response bodies, non-200 statuses, and network errors, using
+  mocked HTTP responses; confirms row values are never surfaced.
+- `extract_smoke_test.py` (CLI) — success/failure reporting, using mocked
+  auth + view-data responses; confirms row values, the auth token, and
+  credentials never appear in its output.
 
 Not tested, requires a machine with access to `insight.erajaya.com`:
 - `discover_api_version()` against the real `serverinfo` endpoint (a user
   confirmed the endpoint itself works via manual `curl`, restApiVersion
   3.29 — but our function that calls and parses it has not been run
   against the live server yet).
-- `discover_view()` against the real server — resolving
-  `ReturnRotate`/`Dashboard1` to real GUIDs has not been attempted yet.
-- `TableauServerClient.get_view_data()` against the real server.
+- `probe_view_data()` / `TableauServerClient.get_view_data()` against the
+  real server for view `741ce0df-8818-4412-93ca-b34c03019219` — not yet
+  attempted.
 - End-to-end `python main.py` run with real credentials.
 
 ## Next steps
@@ -145,9 +169,15 @@ Not tested, requires a machine with access to `insight.erajaya.com`:
    credentials~~ — done: `auth_smoke_test.py` run from a machine with real
    access reported `SUCCESS: authenticated (api_version=3.29)`. Native
    username/password sign-in works; no SSO/browser flow needed.
-3. Run `discover_view.py` from a machine with real access to resolve the
-   real GUID for `ReturnRotate`/`Dashboard1` and set `TABLEAU_VIEW_ID`.
-4. Run `TableauServerClient.get_view_data()` and check the returned CSV
-   against what's expected; adjust `validation.py` if the real schema
-   needs specific column checks.
-5. Only after that: run `python main.py` end-to-end.
+3. ~~Resolve the real GUID for `ReturnRotate`/`Dashboard1`~~ — done:
+   `discover_view.py` resolved it to
+   `741ce0df-8818-4412-93ca-b34c03019219` (workbook "Return & Rotate",
+   view "Dashboard 1").
+4. Run `extract_smoke_test.py` from a machine with real access to confirm
+   the "view data" endpoint actually returns data for this view, and
+   check the reported shape (row/column counts, column names) against
+   what's expected.
+5. If that works, run `TableauServerClient.get_view_data()` (the
+   production path) the same way; adjust `validation.py` if the real
+   schema needs specific column checks.
+6. Only after that: run `python main.py` end-to-end.
