@@ -60,12 +60,30 @@ def load_config() -> Config:
 
 
 def require_view_id(config: Config) -> str:
-    """Raise ConfigError if view_id isn't set.
+    """Raise ConfigError if view_id isn't set or looks malformed.
 
     Kept separate from load_config() so tools that only need to
     authenticate (e.g. auth_smoke_test.py) aren't forced to have
     TABLEAU_VIEW_ID configured -- it's only needed once extraction starts.
+
+    Also guards against a real observed .env mistake: pasting the whole
+    "TABLEAU_VIEW_ID=<guid>" line suggested by discover_view.py's output
+    as the *value* of an existing TABLEAU_VIEW_ID= entry, producing
+    TABLEAU_VIEW_ID=TABLEAU_VIEW_ID=<guid> in .env. That value would
+    otherwise flow untouched into the request URL
+    (.../views/TABLEAU_VIEW_ID=<guid>/data) and fail far from the cause.
+    A real view id is a bare GUID and never contains '=' or its own
+    variable name.
     """
     if not config.view_id:
         raise ConfigError("Missing required environment variable: TABLEAU_VIEW_ID")
+
+    if "=" in config.view_id or "TABLEAU_VIEW_ID" in config.view_id.upper():
+        raise ConfigError(
+            f"TABLEAU_VIEW_ID looks malformed: '{config.view_id}'. This usually "
+            "means .env has the variable name pasted into its own value, e.g. "
+            "TABLEAU_VIEW_ID=TABLEAU_VIEW_ID=<guid> instead of just "
+            "TABLEAU_VIEW_ID=<guid>. Fix .env to contain only the bare GUID."
+        )
+
     return config.view_id

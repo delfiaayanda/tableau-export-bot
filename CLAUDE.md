@@ -104,6 +104,23 @@ view_id: 741ce0df-8818-4412-93ca-b34c03019219
 endpoint (filtered by `contentUrl`) and the follow-up "Query Workbook"
 call both work against the real server.
 
+**A user then hit a malformed request URL**
+(`/views/TABLEAU_VIEW_ID=<guid>/data` instead of `/views/<guid>/data`)
+when running `extract_smoke_test.py`. Inspection of `config.py` →
+`tableau_client.py`/`extraction_probe.py` confirmed `view_id` flows
+straight from `os.environ.get("TABLEAU_VIEW_ID", "")` into the URL
+f-string with no concatenation of the variable's own name anywhere in
+this codebase — so the value stored in the environment/`.env` itself must
+already have contained `TABLEAU_VIEW_ID=<guid>` as its *value* (most
+likely `discover_view.py`'s own suggested line `-> set
+TABLEAU_VIEW_ID=<guid>` pasted whole into an existing `TABLEAU_VIEW_ID=`
+entry, i.e. `TABLEAU_VIEW_ID=TABLEAU_VIEW_ID=<guid>` in `.env`).
+`require_view_id()` now rejects a value containing `=` or the variable's
+own name with a clear `ConfigError` instead of silently building a broken
+URL — see `tests/test_view_id_flow.py`. A subsequent HTTP 406 is a
+separate question, not yet investigated, since the URL had to be fixed
+first.
+
 Still unverified (needs a machine with real access, i.e. not this
 sandbox):
 
