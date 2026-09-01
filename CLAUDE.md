@@ -383,6 +383,28 @@ and adjust the candidate locator lists in
 `_wait_for_dashboard()`, `_export_crosstab_csv()`) to match the real
 page.
 
+**A user ran it locally and hit a real bug**: the browser opened
+Tableau's login page (visually confirmed: username input, password
+input, blue "Sign In" button) but the script never attempted to log in —
+it printed `Opening Tableau...` then immediately failed waiting for the
+dashboard. Root cause: `_login_if_needed()` checked for the password
+field with a single instant `Locator.count()` call, but `count()` does
+not wait for anything to render — on a JS-rendered SPA, the login form
+likely wasn't in the DOM yet at that exact instant, so detection
+false-negatived as "no login form present" and login was silently
+skipped entirely. Fixed by polling for the login form the same way
+`_wait_for_dashboard()` already polls for the Download button
+(`_find_first_with_wait()`, checking across frames too), and by
+confirming the form actually disappears (`password_field.wait_for(state=
+"hidden", ...)`) plus letting network activity settle after clicking
+Sign In, instead of assuming the click worked. A regression test
+(`test_login_if_needed_waits_for_slow_rendering_login_form`) reproduces
+the exact bug shape (field appears only after a couple of polling ticks)
+and confirms the fix. **Still not run against the real server** — this
+fixes a concretely diagnosed bug from a real local run, but the
+downstream steps (dashboard load, Download -> Data -> Crosstab) remain
+unverified from here.
+
 ## What is tested vs. not
 
 Tested in this environment (`pytest`, no network):

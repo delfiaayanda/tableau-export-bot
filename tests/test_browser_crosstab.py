@@ -31,6 +31,7 @@ class FakeLocator:
         self._present = present
         self.click = MagicMock()
         self.fill = MagicMock()
+        self.wait_for = MagicMock()
 
     def count(self):
         return 1 if self._present else 0
@@ -144,7 +145,61 @@ def test_find_first_swallows_exceptions_from_factories():
     assert result is present
 
 
-def test_login_if_needed_skips_when_no_password_field():
+class DelayedFieldPage:
+    """Simulates a login form that only appears in the DOM after a
+    couple of polling ticks -- reproduces the actual reported bug: the
+    SPA hadn't finished rendering the login form at the instant the
+    original code checked for it (a single Locator.count() call, which
+    does not wait), so detection silently reported no login form at all
+    and the whole login step was skipped."""
+
+    def __init__(self, appears_after_ticks=2):
+        self._ticks = 0
+        self._appears_after = appears_after_ticks
+        self.frames = []
+        self.password_field = FakeLocator()
+        self.username_field = FakeLocator()
+        self.submit_button = FakeLocator()
+        self.wait_for_timeout = MagicMock(side_effect=self._tick)
+        self.wait_for_load_state = MagicMock()
+        self.goto = MagicMock()
+        self.screenshot = MagicMock()
+
+    def _tick(self, *args, **kwargs):
+        self._ticks += 1
+
+    def _ready(self):
+        return self._ticks >= self._appears_after
+
+    def get_by_label(self, pattern, **kwargs):
+        text = pattern.pattern.lower() if hasattr(pattern, "pattern") else str(pattern).lower()
+        if not self._ready():
+            return FakeLocator(present=False)
+        if "password" in text:
+            return self.password_field
+        if "username" in text:
+            return self.username_field
+        return FakeLocator(present=False)
+
+    def get_by_role(self, role, name=None, **kwargs):
+        if not self._ready() or name is None:
+            return FakeLocator(present=False)
+        text = name.pattern.lower() if hasattr(name, "pattern") else str(name).lower()
+        if "sign" in text:
+            return self.submit_button
+        return FakeLocator(present=False)
+
+    def get_by_text(self, *args, **kwargs):
+        return FakeLocator(present=False)
+
+    def locator(self, *args, **kwargs):
+        return FakeLocator(present=False)
+
+
+def test_login_if_needed_skips_when_no_password_field(monkeypatch):
+    import src.exportbot.browser_crosstab as bc
+
+    monkeypatch.setattr(bc, "LOGIN_DETECT_TIMEOUT_MS", 10)
     page = ScriptedPage(script=[])
     _login_if_needed(page, "user", "pass")  # must not raise
 
@@ -162,7 +217,10 @@ def test_login_if_needed_fills_and_submits():
     submit_button.click.assert_called_once()
 
 
-def test_login_if_needed_raises_when_username_field_missing():
+def test_login_if_needed_raises_when_username_field_missing(monkeypatch):
+    import src.exportbot.browser_crosstab as bc
+
+    monkeypatch.setattr(bc, "LOGIN_DETECT_TIMEOUT_MS", 10)
     password_field = FakeLocator()
     page = ScriptedPage(script=[password_field])  # username absent
     with pytest.raises(BrowserAutomationError, match="username field"):
@@ -180,6 +238,30 @@ def test_login_if_needed_never_prints_credentials(capsys):
     captured = capsys.readouterr()
     assert "super-secret-user" not in captured.out
     assert "super-secret-pass" not in captured.out
+
+
+def test_login_if_needed_waits_for_slow_rendering_login_form():
+    """The actual reported bug: the login form isn't in the DOM yet at
+    the instant of the first check (SPA still rendering). Detection must
+    poll/wait rather than check once, or login gets silently skipped."""
+    page = DelayedFieldPage(appears_after_ticks=2)
+
+    _login_if_needed(page, "the-user", "the-pass")
+
+    page.username_field.fill.assert_called_once_with("the-user")
+    page.password_field.fill.assert_called_once_with("the-pass")
+    page.submit_button.click.assert_called_once()
+
+
+def test_login_if_needed_waits_for_form_to_disappear_after_submit():
+    password_field = FakeLocator()
+    username_field = FakeLocator()
+    submit_button = FakeLocator()
+    page = ScriptedPage(script=[password_field, username_field, submit_button])
+
+    _login_if_needed(page, "user", "pass")
+
+    password_field.wait_for.assert_called_once_with(state="hidden", timeout=20_000)
 
 
 def test_wait_for_dashboard_returns_when_button_present():

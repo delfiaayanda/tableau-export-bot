@@ -36,7 +36,8 @@ DASHBOARD_URL = "https://insight.erajaya.com/#/views/ReturnRotate/Dashboard1?:id
 EXPORT_FILENAME_PREFIX = "ReturnRotate"
 
 GOTO_TIMEOUT_MS = 30_000
-LOGIN_TIMEOUT_MS = 20_000
+LOGIN_DETECT_TIMEOUT_MS = 15_000
+LOGIN_SUBMIT_TIMEOUT_MS = 20_000
 DASHBOARD_LOAD_TIMEOUT_MS = 60_000
 DOWNLOAD_TIMEOUT_MS = 30_000
 POLL_INTERVAL_MS = 500
@@ -45,6 +46,27 @@ DOWNLOAD_BUTTON_CANDIDATES = [
     lambda s: s.get_by_role("button", name=re.compile(r"^download$", re.I)),
     lambda s: s.locator('[data-tb-test-id="download-Button"]'),
     lambda s: s.locator('button[aria-label="Download" i]'),
+]
+
+PASSWORD_FIELD_CANDIDATES = [
+    lambda s: s.get_by_label(re.compile("password", re.I)),
+    lambda s: s.locator('input[type="password"]'),
+    lambda s: s.locator("#password"),
+    lambda s: s.locator('input[name="password"]'),
+]
+
+USERNAME_FIELD_CANDIDATES = [
+    lambda s: s.get_by_label(re.compile("username", re.I)),
+    lambda s: s.locator('input[name="username"]'),
+    lambda s: s.locator("#username"),
+    lambda s: s.locator('input[type="email"]'),
+    lambda s: s.locator('input[type="text"]').first,
+]
+
+SIGN_IN_BUTTON_CANDIDATES = [
+    lambda s: s.get_by_role("button", name=re.compile(r"sign\s*in", re.I)),
+    lambda s: s.get_by_text(re.compile(r"^sign in$", re.I)),
+    lambda s: s.locator('button[type="submit"]'),
 ]
 
 
@@ -68,7 +90,11 @@ def resolve_executable_path() -> str | None:
 def _find_first(scopes, locator_factories):
     """Tries each locator factory against each scope (page, then each
     frame) in order; returns the first match with at least one visible
-    element, else None. Never raises."""
+    element, else None. Never raises.
+
+    This is a single, instant check -- Locator.count() does not wait for
+    anything to render. Use _find_first_with_wait() for anything that
+    might still be rendering (e.g. right after a navigation)."""
     for scope in scopes:
         for factory in locator_factories:
             try:
@@ -80,6 +106,28 @@ def _find_first(scopes, locator_factories):
     return None
 
 
+def _find_first_with_wait(page, locator_factories, timeout_ms):
+    """Polls _find_first() across the main page and all frames until a
+    match appears or the timeout elapses, returning None on timeout.
+
+    Needed because a freshly-navigated single-page app may not have
+    rendered its form yet at the instant we check -- an instant
+    _find_first() call can false-negative on a login form that is
+    visually present a moment later (the original cause of this
+    function's login-detection bug: the check ran before Tableau's login
+    page had finished rendering, so it looked like there was no login
+    form at all and login was silently skipped)."""
+    deadline = time.monotonic() + timeout_ms / 1000
+    while True:
+        scopes = [page, *page.frames]
+        found = _find_first(scopes, locator_factories)
+        if found is not None:
+            return found
+        if time.monotonic() >= deadline:
+            return None
+        page.wait_for_timeout(POLL_INTERVAL_MS)
+
+
 def _save_debug_screenshot(page, export_dir: Path, label: str) -> None:
     try:
         export_dir.mkdir(parents=True, exist_ok=True)
@@ -89,40 +137,40 @@ def _save_debug_screenshot(page, export_dir: Path, label: str) -> None:
 
 
 def _login_if_needed(page, username: str, password: str) -> None:
-    password_candidates = [
-        lambda s: s.get_by_label(re.compile("password", re.I)),
-        lambda s: s.locator('input[type="password"]'),
-        lambda s: s.locator("#password"),
-    ]
-    password_field = _find_first([page], password_candidates)
+    # Poll for the password field rather than checking once: right after
+    # navigation, Tableau's login page may not have finished rendering
+    # yet, and an instant check would wrongly conclude no login is needed.
+    password_field = _find_first_with_wait(page, PASSWORD_FIELD_CANDIDATES, LOGIN_DETECT_TIMEOUT_MS)
     if password_field is None:
         return  # already authenticated, or no login form present
 
     print("Logging in...")
 
-    username_candidates = [
-        lambda s: s.get_by_label(re.compile("username", re.I)),
-        lambda s: s.locator('input[name="username"]'),
-        lambda s: s.locator("#username"),
-        lambda s: s.locator('input[type="text"]').first,
-    ]
-    username_field = _find_first([page], username_candidates)
+    username_field = _find_first_with_wait(page, USERNAME_FIELD_CANDIDATES, LOGIN_DETECT_TIMEOUT_MS)
     if username_field is None:
         raise BrowserAutomationError("Login page detected but no username field could be found.")
 
     username_field.fill(username)
     password_field.fill(password)
 
-    submit_candidates = [
-        lambda s: s.get_by_role("button", name=re.compile("sign in", re.I)),
-        lambda s: s.locator('button[type="submit"]'),
-    ]
-    submit_button = _find_first([page], submit_candidates)
+    submit_button = _find_first_with_wait(page, SIGN_IN_BUTTON_CANDIDATES, LOGIN_DETECT_TIMEOUT_MS)
     if submit_button is None:
         raise BrowserAutomationError("Login form found but no submit button could be located.")
 
     submit_button.click()
-    page.wait_for_load_state("domcontentloaded", timeout=LOGIN_TIMEOUT_MS)
+
+    # Confirm sign-in actually completed before moving on, instead of
+    # assuming the click worked: wait for the password field to go away
+    # (covers both a full page navigation and an in-place SPA transition
+    # to the dashboard), and best-effort let network activity settle.
+    try:
+        password_field.wait_for(state="hidden", timeout=LOGIN_SUBMIT_TIMEOUT_MS)
+    except Exception:
+        pass
+    try:
+        page.wait_for_load_state("networkidle", timeout=LOGIN_SUBMIT_TIMEOUT_MS)
+    except Exception:
+        pass
 
 
 def _wait_for_dashboard(page) -> None:
