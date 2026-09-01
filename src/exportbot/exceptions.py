@@ -15,3 +15,7 @@ class ExtractionError(ExportBotError):
 
 class ValidationError(ExportBotError):
     """Raised when exported data fails validation checks."""
+
+
+class BrowserAutomationError(ExportBotError):
+    """Raised when browser-driven Tableau UI automation fails."""

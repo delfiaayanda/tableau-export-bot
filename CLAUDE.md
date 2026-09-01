@@ -54,6 +54,15 @@ Layered, each layer swappable via a small interface:
   confirmed to match what the browser's "Download -> Crosstab" menu
   action actually does (see "Native UI Crosstab download" below).
   Standalone; not yet wired into `main.py`.
+- `vizql_crosstab_probe.py` — reproduces the export-command ->
+  tempfile-download tail of Tableau's native VizQL Crosstab flow (see
+  "Native UI Crosstab download" below), given an already-valid session id
+  pasted from a DevTools capture. Cannot establish a session on its own.
+- `browser_crosstab.py` — Playwright browser automation: logs in, opens
+  the dashboard, clicks Download -> Data -> Crosstab, and saves the
+  downloaded CSV. Built after the REST/VizQL investigation confirmed a
+  real browser session is required (see "Browser automation" below).
+  Standalone; not wired into `main.py`/`pipeline.py`.
 - `validation.py` — generic sanity checks on the DataFrame (not empty, has
   columns, not all-null) before export.
 - `exporter.py` — writes the DataFrame to
@@ -341,6 +350,39 @@ but the data-extraction call itself is still explicitly unverified —
 treat it as a starting point to debug from a machine with real network
 access, not as working code.
 
+### Browser automation (`browser_crosstab.py`) -- pivot for a working MVP
+
+Given the time pressure of needing a working end-to-end export and the
+REST/VizQL session-establishment blocker above, the priority shifted to
+browser automation: `browser_crosstab.py` (Playwright) drives an actual
+browser through the exact manual workflow already confirmed to work —
+login, open the dashboard, Download -> Data -> Crosstab, save the CSV.
+This sidesteps the whole "how is a VizQL session minted" question
+entirely, since a real browser mints it the normal way.
+
+**Not exercised against the real server from this environment**: the
+`playwright` Python package installs fine here (PyPI is reachable), but
+`playwright install chromium` fails — `cdn.playwright.dev` isn't on this
+sandbox's egress allowlist, confirmed directly (`403`,
+`"no rule or allowlist entry allows host \"cdn.playwright.dev\""`). Even
+with a browser binary, network access to `insight.erajaya.com` is
+blocked here too. So this code is untested against the live dashboard;
+only its own orchestration/fallback-matching/file-saving logic is unit
+tested (mocked Playwright objects, see below).
+
+**DOM selectors are best-effort**, built from accessible roles/names
+(Tableau's own accessibility conventions), not from an actual DOM
+inspection of this specific dashboard — that inspection was never
+possible from here. Each step tries a short list of fallback locators
+(role/name, then common Tableau test-id/aria-label patterns) across the
+main page and any iframes, in case the viz is embedded. If a step can't
+find what it's looking for, it raises a clear error and saves a
+screenshot to `<EXPORT_DIR>/debug_<step>.png` — check that screenshot
+and adjust the candidate locator lists in
+`src/exportbot/browser_crosstab.py` (`_login_if_needed()`,
+`_wait_for_dashboard()`, `_export_crosstab_csv()`) to match the real
+page.
+
 ## What is tested vs. not
 
 Tested in this environment (`pytest`, no network):
@@ -400,6 +442,28 @@ Tested in this environment (`pytest`, no network):
   isn't supplied; full success/failure reporting otherwise, using mocked
   responses shaped like the real captured JSON; confirms the session id,
   export result key, and row values never appear in its output.
+- `browser_crosstab.py` (module) — `_find_first()`'s fallback matching,
+  `_login_if_needed()` (skip/fill/submit/error paths, confirms
+  credentials never printed), `_wait_for_dashboard()` (success + timeout),
+  and `_export_crosstab_csv()` (full click sequence through to
+  `download.save_as()` with the correct timestamped filename, the
+  optional crosstab-tab click, and the debug-screenshot-on-failure path),
+  and `run_browser_crosstab_export()`'s orchestration (goto order,
+  browser launch args, browser always closed), all using hand-built fake
+  Playwright-like objects -- no real browser, no real Tableau DOM.
+- `browser_crosstab.py` (CLI) — config-error/success/failure reporting,
+  mocking the export function entirely; confirms credentials never
+  appear in output.
+
+Not tested, requires a local machine with a real browser and access to
+`insight.erajaya.com` (impossible from this sandbox — see "Browser
+automation" above for exactly why):
+- Whether the DOM selectors in `browser_crosstab.py` actually match the
+  live dashboard's real markup — entirely unverified; they're
+  best-effort accessible-role/name guesses, not confirmed by inspection.
+- Whether the login form is detected/filled correctly on the real page.
+- Whether Download -> Data -> Crosstab actually triggers a download the
+  way `page.expect_download()` expects.
 
 Not tested, requires a machine with access to `insight.erajaya.com`:
 - `discover_api_version()` against the real `serverinfo` endpoint (a user
@@ -422,6 +486,17 @@ Not tested, requires a machine with access to `insight.erajaya.com`:
 - End-to-end `python main.py` run with real credentials.
 
 ## Next steps
+
+**Immediate priority: run `browser_crosstab.py` locally tonight** (see
+README.md "Browser automation setup"). It has not been run against the
+real server from anywhere in this process — this is the first real test
+of it. If a selector doesn't match, the error names which step failed
+and a screenshot is saved to `<EXPORT_DIR>/debug_<step>.png`; adjust the
+candidate locator lists in `src/exportbot/browser_crosstab.py` and rerun.
+
+The REST/VizQL investigation below is paused, not abandoned — resume it
+if/when there's time to pursue a lighter-weight (non-browser) extraction
+method.
 
 1. ~~Confirm the REST API is enabled and get the real API version~~ — done:
    `GET /api/3.22/serverinfo` → `productVersion 2026.2.0`,

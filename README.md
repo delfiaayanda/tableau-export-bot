@@ -7,9 +7,11 @@ date-stamped Excel file.
 (`insight.erajaya.com`) is confirmed working (native username/password
 sign-in, REST API 3.29), and the view's GUID is confirmed
 (`741ce0df-8818-4412-93ca-b34c03019219` for workbook "Return & Rotate" /
-view "Dashboard 1"). Actual data extraction is still untested — network
-access to that host is blocked from the current development environment.
-See `CLAUDE.md` for details and what's left to verify.
+view "Dashboard 1"). REST/VizQL data extraction hit a real blocker (see
+`CLAUDE.md`), so `browser_crosstab.py` (Playwright) drives the confirmed
+manual UI workflow instead — untested against the real server from this
+development environment (no browser binary can be installed here and
+network access to that host is blocked). See `CLAUDE.md` for details.
 
 ## Project layout
 
@@ -21,6 +23,7 @@ extract_smoke_test.py          Isolated view-data probe (metadata only, no row d
 diagnose_extraction.py         Retries the view-data request with different Accept headers
 crosstab_probe.py              Isolated probe of the documented crosstab-Excel REST endpoint
 vizql_crosstab_probe.py        Experimental: reproduces the browser's native VizQL Crosstab export
+browser_crosstab.py            Playwright browser automation: Download -> Data -> Crosstab -> CSV
 src/exportbot/
   config.py                    Env-var configuration loading
   auth.py                      Authenticator interface + Tableau REST sign-in
@@ -30,6 +33,7 @@ src/exportbot/
   extraction_diagnostics.py    Retries view-data with different Accept headers, reports status/headers
   crosstab_probe.py            Probes the crosstab-Excel endpoint, reports status/size/filename only
   vizql_crosstab_probe.py      Reproduces the VizQL export+tempfile commands given a live session
+  browser_crosstab.py          Playwright: logs in, opens Download -> Data -> Crosstab, saves CSV
   validation.py                Pre-export data checks
   exporter.py                  Excel export (date folder + timestamped file)
   pipeline.py                  Wires the above together
@@ -141,6 +145,50 @@ python main.py
 This will fail today with an authentication/connection error outside a
 network that can reach `insight.erajaya.com` — that's expected until it's
 run from such a machine (see `CLAUDE.md`).
+
+## Browser automation setup (`browser_crosstab.py`)
+
+The REST/VizQL investigation (see `CLAUDE.md`) found that Tableau's
+native "Download -> Crosstab" flow requires a real browser session that
+can't be established via REST alone. `browser_crosstab.py` drives an
+actual browser through the exact confirmed manual workflow instead:
+login -> open the dashboard -> Download -> Data -> Crosstab -> save CSV.
+
+One-time local setup (not runnable from this development sandbox — no
+browser binary can be installed here and network access to
+`insight.erajaya.com` is blocked):
+
+```bash
+pip install -r requirements.txt   # installs the playwright package
+playwright install chromium       # downloads the actual browser binary
+```
+
+If corporate policy blocks installing Chromium, point at an existing
+Chrome/Edge install instead via `.env`:
+
+```
+PLAYWRIGHT_EXECUTABLE_PATH=/path/to/chrome-or-edge
+```
+
+Then run:
+
+```bash
+python browser_crosstab.py
+```
+
+Prints step-by-step progress (`Opening Tableau...`, `Logging in...`,
+`Dashboard loaded.`, `Opening Download menu...`, `Opening Data...`,
+`Exporting Crosstab...`) and finally `SUCCESS: <path to saved CSV>` in
+`EXPORT_DIR`, or `FAILURE: ...` — never prints the password, cookies, or
+any session/auth token.
+
+Set `HEADLESS=false` in `.env` to watch it run in a visible browser
+window while debugging. The DOM selectors it uses are best-effort
+(accessible roles/names) since this dashboard's real DOM was never
+inspected directly — if a step can't find what it's looking for, it
+raises a clear error and saves a screenshot to
+`<EXPORT_DIR>/debug_<step>.png` so the actual page can be inspected and
+the selectors adjusted in `src/exportbot/browser_crosstab.py`.
 
 ## Testing
 
