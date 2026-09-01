@@ -136,23 +136,61 @@ the server declines to produce a representation matching the request's
 Tableau-specific XML/JSON error code) — not 406 — so this points first at
 the `Accept: text/csv` header the current code sends
 (`extraction_probe.py`/`tableau_client.py`), not at credentials or the
-"Export Data" permission. That's not yet confirmed live, though:
-`diagnose_extraction.py` retries the identical request with `Accept:
-text/csv` (current), no `Accept` header at all, `application/json`, and
-`*/*`, reporting sanitized status/content-type/headers for each so the
-real cause (A: our Accept header is wrong, B: a genuine permission
-problem that happens to 406 on this server, or C: some other
-server/gateway-specific behavior) can be determined empirically instead
-of guessed. **Not yet run against the real server.**
+"Export Data" permission.
+
+**A user then ran `diagnose_extraction.py` (the first version, `/data`
+only) and got a striking asymmetric result:**
+
+```
+Accept=text/csv         -> HTTP 406 immediately
+Accept=(none)           -> timeout after 30s, no response
+Accept=application/json -> timeout after 30s, no response
+Accept=*/*              -> timeout after 30s, no response
+```
+
+This rules out "just remove the Accept header" as a fix -- a plain
+content-negotiation rejection would be fast and consistent for every
+unacceptable Accept value, not fast for one and a silent hang for every
+other. Auth/session plumbing was re-verified and is correct: `auth.py`
+parses `credentials.token` -> `auth_token` and `credentials.site.id` ->
+`site_id` from the real signin response unmodified (site id matches the
+user-confirmed `34494572-d6be-4fa1-8c4a-d4836d30345f`), and both flow
+straight into `X-Tableau-Auth` and the `/sites/{site_id}/...` path in
+every probe -- no bug found there.
+
+The leading hypothesis is a routing-dependent intermediary (reverse
+proxy/gateway in front of Tableau Server) or a server-side handler that
+behaves very differently depending on the exact Accept value -- not
+simple client-side content negotiation, and not obviously a 403-shaped
+permission problem either. `diagnose_extraction.py` was extended to (a)
+use a short 10s timeout and report elapsed time for every attempt, so a
+hang is visible immediately rather than after 30s, and (b) also probe the
+"Query View Crosstab Excel" endpoint (`/views/{id}/crosstab/excel`) -- a
+genuinely different server-side code path from `/data` (pivoted crosstab
+vs. detail/summary rows) that might not share the same failure mode, and
+is arguably a better match for "the table data visible in a dashboard"
+than raw view data. **Not yet run against the real server.**
+
+Separately: the user observed that opening this dashboard in a browser
+requires a click before the login flow proceeds. That's very likely a
+UI-layer detail (an interstitial/SSO-redirect page needing a user
+gesture) unrelated to the REST API layer -- the REST calls here
+authenticate directly via `X-Tableau-Auth` and never go through the
+browser's VizQL session at all. It's only worth revisiting as a real
+blocker if REST API access turns out to be fundamentally not viable for
+this view.
 
 Still unverified (needs a machine with real access, i.e. not this
 sandbox):
 
 - Which `Accept` header (if any) the real server actually accepts for
-  this endpoint — `diagnose_extraction.py` has not been run there yet.
+  `/data` or `/crosstab/excel` -- the extended `diagnose_extraction.py`
+  has not been run there yet.
+- Whether `/crosstab/excel` behaves any differently than `/data` for this
+  specific dashboard view.
 - Whether the "view data" endpoint (`extraction_probe.py` /
   `extract_smoke_test.py`, same endpoint as `tableau_client.py`) actually
-  returns data for this view once/if the 406 is resolved.
+  returns data for this view once/if the 406/timeout pattern is resolved.
 - End-to-end `python main.py` run with real credentials and the real
   `TABLEAU_VIEW_ID`.
 
@@ -189,13 +227,17 @@ Tested in this environment (`pytest`, no network):
 - `extract_smoke_test.py` (CLI) — success/failure reporting, using mocked
   auth + view-data responses; confirms row values, the auth token, and
   credentials never appear in its output.
-- `extraction_diagnostics.py` — `probe_with_accept_header()`'s handling of
-  a 406 response, a 200 response, an unsafe header (`Set-Cookie`) being
-  excluded, and a network error, using mocked HTTP responses.
-- `diagnose_extraction.py` (CLI) — reports one sanitized line per Accept
-  variant tried, using a mocked server that 406s only on `Accept:
-  text/csv` (reproducing the reported symptom) and succeeds otherwise;
-  confirms credentials/token/row values never appear in its output.
+- `extraction_diagnostics.py` — `probe_endpoint()`/`probe_with_accept_header()`'s
+  handling of a 406 response, a 200 response, an unsafe header
+  (`Set-Cookie`) being excluded, a timeout (distinguished from a generic
+  network error), and the crosstab-Excel path, using mocked HTTP
+  responses.
+- `diagnose_extraction.py` (CLI) — reports one sanitized line per
+  endpoint/Accept combination tried, using a mocked server that
+  reproduces the exact reported live pattern (fast 406 on `Accept:
+  text/csv`, timeout on every other variant) across both the "Query View
+  Data" and "Query View Crosstab Excel" endpoints; confirms
+  credentials/token/row values never appear in its output.
 
 Not tested, requires a machine with access to `insight.erajaya.com`:
 - `discover_api_version()` against the real `serverinfo` endpoint (a user
@@ -203,10 +245,13 @@ Not tested, requires a machine with access to `insight.erajaya.com`:
   3.29 — but our function that calls and parses it has not been run
   against the live server yet).
 - `probe_with_accept_header()` / `diagnose_extraction.py` against the real
-  server — the 406 investigation is entirely unverified live so far.
+  server — the 406/timeout investigation is entirely unverified live so
+  far.
+- `probe_endpoint()` against `/crosstab/excel` — untested live; unknown
+  whether it shares the same failure mode as `/data`.
 - `probe_view_data()` / `TableauServerClient.get_view_data()` against the
   real server for view `741ce0df-8818-4412-93ca-b34c03019219` — blocked
-  on the 406 above.
+  on the 406/timeout above.
 - End-to-end `python main.py` run with real credentials.
 
 ## Next steps
@@ -225,16 +270,31 @@ Not tested, requires a machine with access to `insight.erajaya.com`:
    `741ce0df-8818-4412-93ca-b34c03019219` (workbook "Return & Rotate",
    view "Dashboard 1").
 4. ~~Run `extract_smoke_test.py` against the real server~~ — done, but it
-   returned HTTP 406, not data. Run `diagnose_extraction.py` next to
-   determine which `Accept` header (if any) the real server accepts for
-   this endpoint.
-5. Once a working `Accept` value (or its absence) is confirmed, update
-   `tableau_client.py`'s production `Accept: text/csv` header to match,
-   with a mocked regression test locking in the corrected header.
-6. Run `extract_smoke_test.py` again to confirm the "view data" endpoint
-   now returns data for this view, and check the reported shape
-   (row/column counts, column names) against what's expected.
-7. If that works, run `TableauServerClient.get_view_data()` (the
+   returned HTTP 406, not data.
+5. ~~Run `diagnose_extraction.py` (v1, `/data` only, 30s timeout)~~ —
+   done: revealed the asymmetric 406-vs-timeout pattern above, ruling out
+   a simple "drop the Accept header" fix. `diagnose_extraction.py` was
+   extended (10s timeout + elapsed time reported per attempt, plus a
+   `/crosstab/excel` probe alongside `/data`) — **not yet run against the
+   real server.**
+6. Run the extended `diagnose_extraction.py` from a machine with real
+   access. Depending on the result:
+   - If any `/data` variant now returns 200 fast, that confirms (A) — a
+     code fix to `tableau_client.py`'s Accept header is enough.
+   - If `/crosstab/excel` succeeds where `/data` doesn't, that's the
+     extraction method to adopt for this dashboard instead.
+   - If every variant on both endpoints times out identically, that
+     points to (B)/(C) — a permission or server/gateway-level issue
+     unrelated to Accept headers, worth checking with a Tableau admin
+     (does this account have "Export Data"/"Download Crosstab" on this
+     specific workbook?) before considering anything more invasive.
+7. Once a working endpoint+Accept combination (or confirmed permission
+   fix) is found, update `tableau_client.py` to match, with a mocked
+   regression test locking in the correction.
+8. Run `extract_smoke_test.py` again to confirm real data comes back, and
+   check the reported shape (row/column counts, column names) against
+   what's expected.
+9. If that works, run `TableauServerClient.get_view_data()` (the
    production path) the same way; adjust `validation.py` if the real
    schema needs specific column checks.
-8. Only after that: run `python main.py` end-to-end.
+10. Only after that: run `python main.py` end-to-end.

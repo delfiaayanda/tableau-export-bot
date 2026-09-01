@@ -6,6 +6,8 @@ the auth token, and row values never appear in any reported line.
 
 from unittest.mock import patch
 
+import requests
+
 from diagnose_extraction import run_diagnosis
 from src.exportbot.config import Config
 
@@ -48,25 +50,29 @@ def _signin_response() -> FakeResponse:
 
 def test_run_diagnosis_reports_one_line_per_variant_without_leaking_secrets():
     def fake_get(url, headers, timeout):
-        # Reproduce the reported symptom: explicit Accept: text/csv gets
-        # 406, everything else succeeds -- so the diagnosis can point at
-        # the Accept header specifically.
+        # Reproduce the reported live pattern exactly: explicit Accept:
+        # text/csv gets a fast 406, every other Accept variant hangs
+        # until timeout -- so the diagnosis can surface that asymmetry
+        # instead of assuming a simple content-negotiation fix.
         if headers.get("Accept") == "text/csv":
             return FakeResponse(status_code=406, text="Not Acceptable", headers={"Content-Type": "text/html"})
-        return FakeResponse(status_code=200, text="Region,Amount\nWest,100\n", headers={"Content-Type": "text/csv"})
+        raise requests.Timeout("timed out")
 
     with patch("src.exportbot.auth.requests.post", return_value=_signin_response()):
         with patch("src.exportbot.extraction_diagnostics.requests.get", side_effect=fake_get):
             success, lines = run_diagnosis(_config(), VIEW_ID)
 
     assert success is True
-    assert len(lines) >= 2
+
+    # Both candidate endpoints are tried, not just "Query View Data".
+    assert any("Query View Data" in line for line in lines)
+    assert any("Query View Crosstab Excel" in line for line in lines)
 
     text_csv_line = next(line for line in lines if "Accept=text/csv" in line)
     assert "HTTP 406" in text_csv_line
 
     none_line = next(line for line in lines if "Accept=(none)" in line)
-    assert "HTTP 200" in none_line
+    assert "timeout" in none_line.lower()
 
     joined = "\n".join(lines)
     assert USERNAME not in joined

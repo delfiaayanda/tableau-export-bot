@@ -88,8 +88,10 @@ names — never row values, credentials, or tokens):
 python extract_smoke_test.py
 ```
 
-If that fails with a non-200 status (e.g. HTTP 406), diagnose it by
-retrying with different `Accept` header values (still metadata only,
+If that fails with a non-200 status or hangs (e.g. HTTP 406, or a
+timeout), diagnose it: retries "Query View Data" and "Query View
+Crosstab Excel" with different `Accept` header values, a short 10s
+timeout, and elapsed time reported per attempt (still metadata only,
 never row data):
 
 ```bash
