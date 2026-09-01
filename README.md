@@ -19,6 +19,7 @@ auth_smoke_test.py             Isolated sign-in check (no data extraction)
 discover_view.py               Isolated workbook/view GUID lookup (no data extraction)
 extract_smoke_test.py          Isolated view-data probe (metadata only, no row data printed)
 diagnose_extraction.py         Retries the view-data request with different Accept headers
+crosstab_probe.py              Isolated probe of the documented crosstab-Excel REST endpoint
 src/exportbot/
   config.py                    Env-var configuration loading
   auth.py                      Authenticator interface + Tableau REST sign-in
@@ -26,6 +27,7 @@ src/exportbot/
   view_discovery.py            Resolves a workbook/view name pair to its GUID
   extraction_probe.py          Probes view-data endpoint, reports shape metadata only
   extraction_diagnostics.py    Retries view-data with different Accept headers, reports status/headers
+  crosstab_probe.py            Probes the crosstab-Excel endpoint, reports status/size/filename only
   validation.py                Pre-export data checks
   exporter.py                  Excel export (date folder + timestamped file)
   pipeline.py                  Wires the above together
@@ -96,6 +98,19 @@ never row data):
 
 ```bash
 python diagnose_extraction.py
+```
+
+Tableau's native "Download -> Crosstab" browser menu is a separate,
+undocumented internal endpoint (cookie-session based), not necessarily
+the same as the public REST API's documented crosstab endpoint. To
+capture what the browser actually does, see the DevTools steps in
+`CLAUDE.md`. In the meantime, this probes the one documented,
+REST-token-authenticated crosstab endpoint as a hypothesis (reports
+status, elapsed time, Content-Type, Content-Disposition, size, and
+filename only -- never the file's contents):
+
+```bash
+python crosstab_probe.py
 ```
 
 ```bash

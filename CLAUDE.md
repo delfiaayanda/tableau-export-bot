@@ -46,6 +46,14 @@ Layered, each layer swappable via a small interface:
   `diagnose_extraction.py` to isolate why a request fails (e.g. HTTP 406)
   without guessing. Never raises, so every variant can be tried even if
   one fails. Standalone; not yet wired into `main.py`.
+- `crosstab_probe.py` — `probe_crosstab_excel()`, an authenticated GET to
+  the documented "Query View Crosstab Excel" endpoint
+  (`.../views/{id}/crosstab/excel`), reporting HTTP status, elapsed time,
+  Content-Type, Content-Disposition, response size, and filename --
+  never the file's contents. This is a *hypothesis* probe: it is NOT
+  confirmed to match what the browser's "Download -> Crosstab" menu
+  action actually does (see "Native UI Crosstab download" below).
+  Standalone; not yet wired into `main.py`.
 - `validation.py` — generic sanity checks on the DataFrame (not empty, has
   columns, not all-null) before export.
 - `exporter.py` — writes the DataFrame to
@@ -180,14 +188,87 @@ browser's VizQL session at all. It's only worth revisiting as a real
 blocker if REST API access turns out to be fundamentally not viable for
 this view.
 
+**The user then confirmed visually, from the live dashboard's UI, that a
+native "Download" menu exists** with entries: Image, Vector Image, Data,
+Crosstab, PDF, PowerPoint, Tableau Workbook. This does NOT by itself
+confirm which backend endpoint "Crosstab" calls -- see below.
+
+### Native UI Crosstab download -- investigation status
+
+Tableau's interactive web client (the dashboard you click around in) is
+architecturally separate from the public REST API under `/api/{version}/`.
+It's built on VizQL and its UI actions (including "Download -> Crosstab")
+have historically been observed, across the Tableau Server community, to
+call **internal, undocumented, cookie-session-based endpoints** -- not
+the `X-Tableau-Auth`-token-based public REST API. The exact internal path
+varies by Tableau Server version and is not part of any documented
+contract, so it should not be guessed at with confidence; it must be
+captured directly.
+
+**We could not capture it in this session**: no browser automation tool
+is available here, and this sandbox's network policy blocks
+`insight.erajaya.com` entirely (see "Network blocker" above) even if one
+were. `src/exportbot/crosstab_probe.py` / `crosstab_probe.py` (CLI) were built
+instead to test the one endpoint we can concretely name and already have
+infrastructure for: the *documented* public REST "Query View Crosstab
+Excel" endpoint (`GET .../views/{id}/crosstab/excel`), authenticated via
+our existing `X-Tableau-Auth` session. This is explicitly a **hypothesis
+probe**, not a claim that it matches the browser's actual request --
+**not yet run against the real server.**
+
+**DevTools capture steps** (to determine the real browser request; see
+`crosstab_probe.py`'s docstring for why this matters):
+
+1. In Chrome (or any Chromium-based browser), navigate to
+   `https://insight.erajaya.com/#/views/ReturnRotate/Dashboard1` and log
+   in normally.
+2. Open DevTools (F12, or Cmd+Option+I on Mac) and go to the **Network**
+   tab.
+3. Check **Preserve log**, then click the "clear" (🚫) button so the log
+   is empty.
+4. On the dashboard, click the **Download** toolbar icon, then
+   **Crosstab**, and complete any sheet/format prompt Tableau shows.
+5. In the Network tab, find the new request(s) that appear right after
+   the click (look for a path containing something like "crosstab",
+   "export", or "download", or a response `Content-Type` of
+   `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet` or
+   `text/csv`). If more than one request fires (e.g. a setup call
+   followed by the actual file), note all of them in order.
+6. Click the relevant request and read its **Headers** panel. Note, and
+   share back:
+   - Request method (GET/POST) and full path (the host is already known,
+     so that part isn't sensitive)
+   - Query string parameters (names and values, unless a value looks
+     like a session/auth token)
+   - Which request header **names** were sent (e.g. `Cookie`,
+     `X-XSRF-TOKEN`, `Accept`) -- but not their values if they look like
+     session IDs, tokens, or cookies
+   - Whether a request body/payload is present, and its field names
+   - Response headers `Content-Type`, `Content-Disposition` (often
+     contains the filename -- safe to share in full), `Content-Length`
+7. **Do not** paste a raw "Copy as cURL" export to me -- it embeds live
+   session cookies. If you use it to double check something locally,
+   strip the `-H 'cookie: ...'` and any token-bearing headers first.
+8. The "Initiator" column/tab for that request can hint at which part of
+   Tableau's JS triggered it, useful context but not required.
+
+Once that's captured, tell me the sanitized shape (method, path, which
+headers were present, response `Content-Type`/`Content-Disposition`) and
+`crosstab_probe.py` will be adjusted (or a cookie-based variant added) to
+match it exactly -- rather than continuing to guess.
+
 Still unverified (needs a machine with real access, i.e. not this
 sandbox):
 
+- What request Tableau's own browser UI generates for "Download ->
+  Crosstab" -- requires the DevTools capture above.
 - Which `Accept` header (if any) the real server actually accepts for
   `/data` or `/crosstab/excel` -- the extended `diagnose_extraction.py`
   has not been run there yet.
-- Whether `/crosstab/excel` behaves any differently than `/data` for this
-  specific dashboard view.
+- Whether the documented `/crosstab/excel` REST endpoint (as opposed to
+  whatever the browser calls) behaves any differently than `/data` for
+  this specific dashboard view -- `crosstab_probe.py` has not been run
+  there yet.
 - Whether the "view data" endpoint (`extraction_probe.py` /
   `extract_smoke_test.py`, same endpoint as `tableau_client.py`) actually
   returns data for this view once/if the 406/timeout pattern is resolved.
@@ -238,6 +319,14 @@ Tested in this environment (`pytest`, no network):
   text/csv`, timeout on every other variant) across both the "Query View
   Data" and "Query View Crosstab Excel" endpoints; confirms
   credentials/token/row values never appear in its output.
+- `crosstab_probe.py` (module) — `probe_crosstab_excel()`'s handling of a
+  successful response with a `Content-Disposition` filename (both the
+  plain and RFC 5987 `filename*=` forms), a 403, a timeout, and a network
+  error, using mocked HTTP responses; confirms the response body's
+  contents are never surfaced, only metadata about it.
+- `crosstab_probe.py` (CLI) — success/failure reporting, using mocked
+  auth + crosstab responses; confirms credentials, the auth token, and
+  file contents never appear in its output.
 
 Not tested, requires a machine with access to `insight.erajaya.com`:
 - `discover_api_version()` against the real `serverinfo` endpoint (a user
@@ -278,23 +367,35 @@ Not tested, requires a machine with access to `insight.erajaya.com`:
    `/crosstab/excel` probe alongside `/data`) — **not yet run against the
    real server.**
 6. Run the extended `diagnose_extraction.py` from a machine with real
-   access. Depending on the result:
-   - If any `/data` variant now returns 200 fast, that confirms (A) — a
-     code fix to `tableau_client.py`'s Accept header is enough.
-   - If `/crosstab/excel` succeeds where `/data` doesn't, that's the
-     extraction method to adopt for this dashboard instead.
-   - If every variant on both endpoints times out identically, that
-     points to (B)/(C) — a permission or server/gateway-level issue
-     unrelated to Accept headers, worth checking with a Tableau admin
-     (does this account have "Export Data"/"Download Crosstab" on this
-     specific workbook?) before considering anything more invasive.
-7. Once a working endpoint+Accept combination (or confirmed permission
-   fix) is found, update `tableau_client.py` to match, with a mocked
-   regression test locking in the correction.
-8. Run `extract_smoke_test.py` again to confirm real data comes back, and
-   check the reported shape (row/column counts, column names) against
-   what's expected.
-9. If that works, run `TableauServerClient.get_view_data()` (the
-   production path) the same way; adjust `validation.py` if the real
-   schema needs specific column checks.
-10. Only after that: run `python main.py` end-to-end.
+   access.
+7. ~~The user confirmed visually that the dashboard's UI has a native
+   "Download -> Crosstab" menu~~ — done. This does not by itself confirm
+   which backend endpoint it calls; that requires the DevTools capture
+   documented above. **Do the DevTools capture next** and report back the
+   sanitized request shape (method, path, header names, response
+   Content-Type/Content-Disposition).
+8. Run `crosstab_probe.py` from a machine with real access, to test the
+   one endpoint we can concretely name (the documented REST
+   `/crosstab/excel`) independently of the DevTools capture.
+9. Once the real browser request is known (step 7) and/or a working
+   endpoint+Accept combination is confirmed (steps 6/8), decide the
+   extraction method:
+   - If a REST endpoint (`/data` or `/crosstab/excel`) works via our
+     existing `X-Tableau-Auth` session, that's the method — update
+     `tableau_client.py` to match, with a mocked regression test locking
+     in the correction.
+   - If only the browser's internal cookie-session endpoint works, that
+     changes the auth model entirely (cookie-based, not token-based) and
+     needs a new, explicit decision before any code is written for it.
+   - If everything still times out or 403s regardless of endpoint, that
+     points to (B)/(C) — a permission or server/gateway-level issue,
+     worth checking with a Tableau admin (does this account have "Export
+     Data"/"Download Crosstab" on this specific workbook?).
+10. Run `extract_smoke_test.py` (or the equivalent for whichever endpoint
+    was confirmed) again to see real data come back, and check the
+    reported shape (row/column counts, column names) against what's
+    expected.
+11. If that works, run `TableauServerClient.get_view_data()` (the
+    production path) the same way; adjust `validation.py` if the real
+    schema needs specific column checks.
+12. Only after that: run `python main.py` end-to-end.
