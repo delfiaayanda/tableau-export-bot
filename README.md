@@ -3,8 +3,9 @@
 Automates exporting the `ReturnRotate/Dashboard1` Tableau view to a
 date-stamped Excel file.
 
-**Status: scaffolding only.** Authentication and extraction against the
-real Tableau server (`insight.erajaya.com`) have not been tested — network
+**Status: in progress.** Authentication against the real Tableau server
+(`insight.erajaya.com`) is confirmed working (native username/password
+sign-in, REST API 3.29). Data extraction is still untested — network
 access to that host is blocked from the current development environment.
 See `CLAUDE.md` for details and what's left to verify.
 
@@ -13,16 +14,18 @@ See `CLAUDE.md` for details and what's left to verify.
 ```
 main.py                        CLI entry point
 auth_smoke_test.py             Isolated sign-in check (no data extraction)
+discover_view.py               Isolated workbook/view GUID lookup (no data extraction)
 src/exportbot/
   config.py                    Env-var configuration loading
   auth.py                      Authenticator interface + Tableau REST sign-in
   tableau_client.py            TableauClient interface + REST view-data fetch
+  view_discovery.py            Resolves a workbook/view name pair to its GUID
   validation.py                Pre-export data checks
   exporter.py                  Excel export (date folder + timestamped file)
   pipeline.py                  Wires the above together
   logging_setup.py             Logging configuration
   exceptions.py                Shared exception types
-  serverinfo.py                 Auto-detects the REST API version (unauthenticated)
+  serverinfo.py                Auto-detects the REST API version (unauthenticated)
 tests/                         Unit tests (no network required)
 ```
 
@@ -60,6 +63,16 @@ python auth_smoke_test.py
 ```
 
 Prints `SUCCESS: ...` or `FAILURE: <sanitized status/message>`.
+
+Once sign-in succeeds, resolve the real view GUID for `TABLEAU_VIEW_ID`
+(also sign-in only, no data extraction):
+
+```bash
+python discover_view.py
+```
+
+Prints `SUCCESS: workbook='...' (id=...) view='...' (id=...) -> set TABLEAU_VIEW_ID=...`
+or a sanitized `FAILURE: ...`.
 
 ```bash
 python main.py

@@ -27,6 +27,12 @@ Layered, each layer swappable via a small interface:
 - `tableau_client.py` — `TableauClient` ABC + `TableauServerClient`, which
   GETs the REST "view data" endpoint (returns CSV) and parses it into a
   pandas DataFrame.
+- `view_discovery.py` — `discover_view()`, an authenticated lookup that
+  resolves a workbook/view name pair (e.g. `ReturnRotate`/`Dashboard1`) to
+  the GUIDs the REST API actually needs, via `GET .../sites/{site-id}/views`
+  filtered by `contentUrl`, plus a follow-up `GET .../workbooks/{id}` for
+  the workbook's display name. Standalone from the pipeline; not yet wired
+  into `main.py`.
 - `validation.py` — generic sanity checks on the DataFrame (not empty, has
   columns, not all-null) before export.
 - `exporter.py` — writes the DataFrame to
@@ -74,23 +80,26 @@ A user confirmed the login page is Tableau's native username/password
 form, not SSO/SAML — so `TABLEAU_USERNAME`/`TABLEAU_PASSWORD` sign-in
 against `/auth/signin` is the right flow (no browser-based login needed).
 
+**A user ran `auth_smoke_test.py` from a machine with real access and it
+reported `SUCCESS: authenticated (api_version=3.29)`.** Sign-in against
+the real server is confirmed working. Credentials were never seen,
+logged, or committed in this process.
+
 Still unverified (needs a machine with real access, i.e. not this
 sandbox):
 
-- Whether `TABLEAU_USERNAME`/`TABLEAU_PASSWORD` sign-in actually succeeds
-  against `/auth/signin`. **No sign-in attempt has been made yet from
-  this environment.** `auth_smoke_test.py` is an isolated CLI for testing
-  exactly this (sign-in only, no data extraction, never prints
-  credentials/tokens — see "Running" in README.md).
+- Whether `discover_view()` (`view_discovery.py` / `discover_view.py`)
+  actually resolves `ReturnRotate`/`Dashboard1` to real GUIDs against the
+  live server. **Not yet run there — only mocked-response unit tests.**
 - Whether the "view data" endpoint returns the CSV shape assumed by
   `tableau_client.py`, or whether crosstab/export endpoints work better.
-- The real `TABLEAU_VIEW_ID` for `ReturnRotate/Dashboard1` (the URL only
-  gives the human-readable view path, not the GUID the API needs).
+- End-to-end `python main.py` run with real credentials and a real
+  `TABLEAU_VIEW_ID`.
 
-`auth.py` and `tableau_client.py` are written to match Tableau's
-documented REST API, but the sign-in and data-extraction calls themselves
-are still explicitly unverified — treat them as a starting point to debug
-from a machine with real network access, not as working code.
+`tableau_client.py` is written to match Tableau's documented REST API,
+but the data-extraction call itself is still explicitly unverified —
+treat it as a starting point to debug from a machine with real network
+access, not as working code.
 
 ## What is tested vs. not
 
@@ -108,16 +117,22 @@ Tested in this environment (`pytest`, no network):
   pipeline calls its collaborators correctly; they do **not** simulate or
   validate real Tableau API behavior.
 
+- `view_discovery.py` — `discover_view()`'s handling of Tableau's
+  documented Views/Workbook JSON shapes, using mocked HTTP responses (not
+  a claim that it matches the live server byte-for-byte).
+- `discover_view.py` (CLI) — success/failure reporting, using mocked
+  auth + view-lookup responses; confirms the auth token and credentials
+  never appear in its output.
+
 Not tested, requires a machine with access to `insight.erajaya.com`:
 - `discover_api_version()` against the real `serverinfo` endpoint (a user
   confirmed the endpoint itself works via manual `curl`, restApiVersion
   3.29 — but our function that calls and parses it has not been run
   against the live server yet).
-- `TableauServerAuthenticator.authenticate()` against the real server —
-  **no sign-in attempt has been made with real credentials.**
+- `discover_view()` against the real server — resolving
+  `ReturnRotate`/`Dashboard1` to real GUIDs has not been attempted yet.
 - `TableauServerClient.get_view_data()` against the real server.
 - End-to-end `python main.py` run with real credentials.
-- Discovering the real `TABLEAU_VIEW_ID` for `ReturnRotate/Dashboard1`.
 
 ## Next steps
 
@@ -126,16 +141,13 @@ Not tested, requires a machine with access to `insight.erajaya.com`:
    `restApiVersion 3.29`. The API version is no longer hardcoded as the
    only option: `main.py` now calls `discover_api_version()` at startup
    (or uses `TABLEAU_API_VERSION` from `.env` if set).
-2. From a machine with real access, run `discover_api_version()` itself
-   (not just a manual curl) to confirm our parsing works against the live
-   response.
-3. Attempt `TableauServerAuthenticator.authenticate()` with real
-   credentials; if it fails with a redirect to an SSO login page, the
-   username/password flow won't work and a browser-based (Playwright)
-   login capturing session cookies/tokens will be needed instead.
-4. Find the view's GUID (Tableau REST `views` list endpoint, or browser
-   dev tools) to set `TABLEAU_VIEW_ID`.
-5. Run `TableauServerClient.get_view_data()` and check the returned CSV
+2. ~~Attempt `TableauServerAuthenticator.authenticate()` with real
+   credentials~~ — done: `auth_smoke_test.py` run from a machine with real
+   access reported `SUCCESS: authenticated (api_version=3.29)`. Native
+   username/password sign-in works; no SSO/browser flow needed.
+3. Run `discover_view.py` from a machine with real access to resolve the
+   real GUID for `ReturnRotate`/`Dashboard1` and set `TABLEAU_VIEW_ID`.
+4. Run `TableauServerClient.get_view_data()` and check the returned CSV
    against what's expected; adjust `validation.py` if the real schema
    needs specific column checks.
-6. Only after that: run `python main.py` end-to-end.
+5. Only after that: run `python main.py` end-to-end.
