@@ -69,6 +69,16 @@ SIGN_IN_BUTTON_CANDIDATES = [
     lambda s: s.locator('button[type="submit"]'),
 ]
 
+# Tableau glass-pane/dialog overlays observed in a real run to intercept
+# pointer events on the final export button even while Playwright reports
+# it visible/enabled/stable -- causing Locator.click() to retry-and-timeout
+# instead of ever landing. Waited out before the final click only.
+OVERLAY_SELECTORS = [
+    "#loadingGlassPane",
+    '[data-tb-test-id="Dialog-Provider-Dialog-Glass"]',
+]
+OVERLAY_CLEAR_TIMEOUT_MS = 30_000
+
 
 def generate_export_filename(now=None) -> str:
     from datetime import datetime
@@ -126,6 +136,22 @@ def _find_first_with_wait(page, locator_factories, timeout_ms):
         if time.monotonic() >= deadline:
             return None
         page.wait_for_timeout(POLL_INTERVAL_MS)
+
+
+def _wait_for_overlays_to_clear(page) -> None:
+    """Waits for known Tableau glass-pane/dialog overlays to become
+    hidden before the final export click is attempted.
+
+    Locator.wait_for(state="hidden") is satisfied both by an element that
+    is genuinely hidden/detached AND by a selector that matches nothing
+    at all -- so an overlay that doesn't exist on this page resolves
+    immediately here, never an error. Only a real, still-visible overlay
+    that never clears raises (a TimeoutError), which is intentionally
+    left to propagate to the caller -- that's a real, actionable failure
+    worth surfacing distinctly, not something to silently swallow."""
+    for selector in OVERLAY_SELECTORS:
+        for scope in [page, *page.frames]:
+            scope.locator(selector).first.wait_for(state="hidden", timeout=OVERLAY_CLEAR_TIMEOUT_MS)
 
 
 def _save_debug_screenshot(page, export_dir: Path, label: str) -> None:
@@ -235,9 +261,19 @@ def _export_crosstab_csv(page, export_dir: Path):
         _save_debug_screenshot(page, export_dir, "export-button-not-found")
         raise BrowserAutomationError("Could not find the CSV export/download button in the Data dialog.")
 
-    with page.expect_download(timeout=DOWNLOAD_TIMEOUT_MS) as download_info:
-        export_button.click()
-    download = download_info.value
+    try:
+        # A Tableau glass-pane/dialog overlay can intercept pointer events
+        # here even though the button itself is visible/enabled/stable --
+        # wait for it to clear before attempting the click, rather than
+        # letting Playwright retry-and-timeout against a blocked click.
+        _wait_for_overlays_to_clear(page)
+        export_button.wait_for(state="visible", timeout=OVERLAY_CLEAR_TIMEOUT_MS)
+        with page.expect_download(timeout=DOWNLOAD_TIMEOUT_MS) as download_info:
+            export_button.click()
+        download = download_info.value
+    except Exception as exc:
+        _save_debug_screenshot(page, export_dir, "export-button-click-failed")
+        raise BrowserAutomationError(f"Could not click the CSV export/download button: {exc}") from exc
 
     export_dir.mkdir(parents=True, exist_ok=True)
     target_path = export_dir / generate_export_filename()

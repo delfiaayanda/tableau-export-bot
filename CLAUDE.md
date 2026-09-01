@@ -400,10 +400,30 @@ confirming the form actually disappears (`password_field.wait_for(state=
 Sign In, instead of assuming the click worked. A regression test
 (`test_login_if_needed_waits_for_slow_rendering_login_form`) reproduces
 the exact bug shape (field appears only after a couple of polling ticks)
-and confirms the fix. **Still not run against the real server** — this
-fixes a concretely diagnosed bug from a real local run, but the
-downstream steps (dashboard load, Download -> Data -> Crosstab) remain
-unverified from here.
+and confirms the fix.
+
+**A user then confirmed login, dashboard load, and Download -> Data ->
+Crosstab all work** — real progress, driven entirely from a real local
+run this environment couldn't produce itself. The flow got stuck only on
+the final export-button click:
+`Locator.click: Timeout 30000ms exceeded`, with Playwright's own call log
+showing the button as visible/enabled/stable but blocked by
+`<div class="wcGlassPane" id="loadingGlassPane">` and then
+`[data-tb-test-id="Dialog-Provider-Dialog-Glass"]` intercepting pointer
+events. Fixed by waiting for both overlays to reach Playwright's
+`"hidden"` state (`Locator.wait_for(state="hidden")`, which already
+resolves immediately if a selector matches nothing — so an overlay that
+never appears is not an error) immediately before the final click,
+wrapped so any failure at this step (overlay never clears, click still
+fails) produces a clear `BrowserAutomationError` and a debug screenshot
+instead of a raw, uncaught Playwright traceback. Two regression tests
+cover this: `test_export_crosstab_csv_waits_for_overlays_before_final_click`
+(overlays clear normally) and
+`test_export_crosstab_csv_raises_and_screenshots_when_overlay_never_clears`
+(a stuck overlay is reported cleanly, not left to crash the process).
+**Still not run against the real server from here** — this fixes a
+concretely diagnosed bug from a real local run; whether the fix actually
+lets the CSV download complete has not been confirmed yet.
 
 ## What is tested vs. not
 
@@ -466,13 +486,17 @@ Tested in this environment (`pytest`, no network):
   export result key, and row values never appear in its output.
 - `browser_crosstab.py` (module) — `_find_first()`'s fallback matching,
   `_login_if_needed()` (skip/fill/submit/error paths, confirms
-  credentials never printed), `_wait_for_dashboard()` (success + timeout),
-  and `_export_crosstab_csv()` (full click sequence through to
-  `download.save_as()` with the correct timestamped filename, the
-  optional crosstab-tab click, and the debug-screenshot-on-failure path),
-  and `run_browser_crosstab_export()`'s orchestration (goto order,
-  browser launch args, browser always closed), all using hand-built fake
-  Playwright-like objects -- no real browser, no real Tableau DOM.
+  credentials never printed, and the slow-rendering-form regression case),
+  `_wait_for_dashboard()` (success + timeout), and `_export_crosstab_csv()`
+  (full click sequence through to `download.save_as()` with the correct
+  timestamped filename, the optional crosstab-tab click, the
+  debug-screenshot-on-failure path, and the overlay-wait-before-final-click
+  regression cases -- overlays clearing normally, and a stuck overlay
+  producing a clean `BrowserAutomationError` instead of a raw Playwright
+  traceback), and `run_browser_crosstab_export()`'s orchestration (goto
+  order, browser launch args, browser always closed), all using
+  hand-built fake Playwright-like objects -- no real browser, no real
+  Tableau DOM.
 - `browser_crosstab.py` (CLI) — config-error/success/failure reporting,
   mocking the export function entirely; confirms credentials never
   appear in output.

@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from src.exportbot.browser_crosstab import (
+    OVERLAY_SELECTORS,
     _export_crosstab_csv,
     _find_first,
     _login_if_needed,
@@ -95,6 +96,62 @@ class ScriptedPage:
 
     def locator(self, *args, **kwargs):
         return self._next()
+
+    def expect_download(self, timeout=None):
+        return _DownloadCM(self._download)
+
+
+class OverlayAwarePage:
+    """Provides download/data/crosstab/export candidates matching
+    ScriptedPage's happy-path shape (found on each lookup's first
+    candidate, via get_by_role/get_by_text), plus dedicated,
+    independently-controllable overlay locators for each selector in
+    OVERLAY_SELECTORS -- reachable only via .locator(), never consumed by
+    the role/text-based candidate lookups, so overlay behavior can be
+    tested in isolation from the button-finding logic."""
+
+    def __init__(self, overlay_wait_side_effect=None, download=None):
+        self.frames = []
+        self.download_btn = FakeLocator()
+        self.data_item = FakeLocator()
+        self.crosstab_tab = FakeLocator()
+        self.export_btn = FakeLocator()
+        self._role_script = [self.download_btn, self.data_item, self.crosstab_tab, self.export_btn]
+        self._role_pos = 0
+
+        self.overlay_locators = {}
+        for selector in OVERLAY_SELECTORS:
+            locator = FakeLocator()
+            if overlay_wait_side_effect is not None:
+                locator.wait_for = MagicMock(side_effect=overlay_wait_side_effect)
+            self.overlay_locators[selector] = locator
+
+        self._download = download
+        self.wait_for_timeout = MagicMock()
+        self.wait_for_load_state = MagicMock()
+        self.goto = MagicMock()
+        self.screenshot = MagicMock()
+
+    def _next_role(self):
+        if self._role_pos >= len(self._role_script):
+            return FakeLocator(present=False)
+        loc = self._role_script[self._role_pos]
+        self._role_pos += 1
+        return loc
+
+    def get_by_role(self, *args, **kwargs):
+        return self._next_role()
+
+    def get_by_text(self, *args, **kwargs):
+        return self._next_role()
+
+    def get_by_label(self, *args, **kwargs):
+        return FakeLocator(present=False)
+
+    def locator(self, selector, **kwargs):
+        if selector in self.overlay_locators:
+            return self.overlay_locators[selector]
+        return FakeLocator(present=False)
 
     def expect_download(self, timeout=None):
         return _DownloadCM(self._download)
@@ -335,6 +392,44 @@ def test_export_crosstab_csv_proceeds_without_optional_crosstab_tab(tmp_path):
 
     export_btn.click.assert_called_once()
     assert result.name.startswith("ReturnRotate_")
+
+
+def test_export_crosstab_csv_waits_for_overlays_before_final_click(tmp_path):
+    """Reproduces the real reported bug: the export button is visible/
+    enabled/stable but a Tableau glass-pane/dialog overlay intercepts
+    pointer events, so Playwright's click() retries and times out. The
+    fix must explicitly wait for each known overlay to clear (via
+    Locator.wait_for(state="hidden")) before attempting the click."""
+    download = FakeDownload()
+    page = OverlayAwarePage(download=download)  # overlays resolve immediately (default MagicMock)
+
+    result = _export_crosstab_csv(page, tmp_path)
+
+    for selector in OVERLAY_SELECTORS:
+        page.overlay_locators[selector].wait_for.assert_called_once_with(
+            state="hidden", timeout=30_000
+        )
+    page.export_btn.click.assert_called_once()
+    download.save_as.assert_called_once()
+    assert result.name.startswith("ReturnRotate_")
+
+
+def test_export_crosstab_csv_raises_and_screenshots_when_overlay_never_clears(tmp_path):
+    """If an overlay genuinely never clears (real stuck-dialog case), the
+    raw Playwright TimeoutError must not leak out uncaught -- it should
+    be turned into a clear BrowserAutomationError with a debug
+    screenshot, same as every other failure mode in this module."""
+
+    def always_times_out(*args, **kwargs):
+        raise TimeoutError("Timeout 30000ms exceeded waiting for element to be hidden")
+
+    page = OverlayAwarePage(overlay_wait_side_effect=always_times_out)
+
+    with pytest.raises(BrowserAutomationError, match="Could not click the CSV export/download button"):
+        _export_crosstab_csv(page, tmp_path)
+
+    page.export_btn.click.assert_not_called()
+    page.screenshot.assert_called_once()
 
 
 def test_run_browser_crosstab_export_orchestrates_and_closes_browser(tmp_path):
