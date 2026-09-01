@@ -1,12 +1,11 @@
 import pytest
 
-from src.exportbot.config import ConfigError, load_config
+from src.exportbot.config import ConfigError, load_config, require_view_id
 
 REQUIRED_VARS = {
     "TABLEAU_SERVER_URL": "https://insight.example.com",
     "TABLEAU_USERNAME": "someuser",
     "TABLEAU_PASSWORD": "somepassword",
-    "TABLEAU_VIEW_ID": "some-view-id",
 }
 
 
@@ -15,6 +14,7 @@ def _clear_env(monkeypatch):
         *REQUIRED_VARS,
         "TABLEAU_SITE",
         "TABLEAU_API_VERSION",
+        "TABLEAU_VIEW_ID",
         "EXPORT_DIR",
         "LOG_LEVEL",
     ]:
@@ -39,11 +39,33 @@ def test_load_config_reads_all_required_vars(monkeypatch):
     assert config.tableau_server_url == REQUIRED_VARS["TABLEAU_SERVER_URL"]
     assert config.tableau_username == REQUIRED_VARS["TABLEAU_USERNAME"]
     assert config.tableau_password == REQUIRED_VARS["TABLEAU_PASSWORD"]
-    assert config.view_id == REQUIRED_VARS["TABLEAU_VIEW_ID"]
     assert config.tableau_site == ""
     assert config.tableau_api_version == ""
     assert config.export_dir == "exports"
     assert config.log_level == "INFO"
+
+
+def test_load_config_does_not_require_view_id(monkeypatch):
+    """TABLEAU_VIEW_ID is only needed once extraction starts (require_view_id),
+    not for tools like auth_smoke_test.py that only authenticate."""
+    _clear_env(monkeypatch)
+    for key, value in REQUIRED_VARS.items():
+        monkeypatch.setenv(key, value)
+
+    config = load_config()
+
+    assert config.view_id == ""
+
+
+def test_load_config_reads_view_id_when_set(monkeypatch):
+    _clear_env(monkeypatch)
+    for key, value in REQUIRED_VARS.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("TABLEAU_VIEW_ID", "some-view-id")
+
+    config = load_config()
+
+    assert config.view_id == "some-view-id"
 
 
 def test_load_config_applies_optional_overrides(monkeypatch):
@@ -71,3 +93,23 @@ def test_load_config_rejects_blank_value(monkeypatch):
 
     with pytest.raises(ConfigError, match="TABLEAU_PASSWORD"):
         load_config()
+
+
+def test_require_view_id_raises_when_blank(monkeypatch):
+    _clear_env(monkeypatch)
+    for key, value in REQUIRED_VARS.items():
+        monkeypatch.setenv(key, value)
+    config = load_config()
+
+    with pytest.raises(ConfigError, match="TABLEAU_VIEW_ID"):
+        require_view_id(config)
+
+
+def test_require_view_id_returns_value_when_set(monkeypatch):
+    _clear_env(monkeypatch)
+    for key, value in REQUIRED_VARS.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("TABLEAU_VIEW_ID", "some-view-id")
+    config = load_config()
+
+    assert require_view_id(config) == "some-view-id"

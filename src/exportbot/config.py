@@ -53,7 +53,19 @@ def load_config() -> Config:
         tableau_username=_require("TABLEAU_USERNAME"),
         tableau_password=_require("TABLEAU_PASSWORD"),
         tableau_api_version=os.environ.get("TABLEAU_API_VERSION", "").strip(),
-        view_id=_require("TABLEAU_VIEW_ID"),
+        view_id=os.environ.get("TABLEAU_VIEW_ID", "").strip(),
         export_dir=os.environ.get("EXPORT_DIR", "exports"),
         log_level=os.environ.get("LOG_LEVEL", "INFO"),
     )
+
+
+def require_view_id(config: Config) -> str:
+    """Raise ConfigError if view_id isn't set.
+
+    Kept separate from load_config() so tools that only need to
+    authenticate (e.g. auth_smoke_test.py) aren't forced to have
+    TABLEAU_VIEW_ID configured -- it's only needed once extraction starts.
+    """
+    if not config.view_id:
+        raise ConfigError("Missing required environment variable: TABLEAU_VIEW_ID")
+    return config.view_id

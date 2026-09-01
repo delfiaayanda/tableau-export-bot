@@ -10,7 +10,7 @@ import logging
 from pathlib import Path
 
 from .auth import Authenticator
-from .config import Config
+from .config import Config, require_view_id
 from .exporter import export_to_excel
 from .tableau_client import TableauClient
 from .validation import validate_dataframe
@@ -27,6 +27,8 @@ def run_pipeline(
     client_factory: callable(TableauSession) -> TableauClient, since the
     client depends on the session produced by authentication.
     """
+    require_view_id(config)
+
     logger.info("Authenticating with Tableau...")
     session = authenticator.authenticate(config)
 

@@ -37,6 +37,9 @@ def main() -> int:
             client_factory=lambda session: TableauServerClient(session),
             logger=logger,
         )
+    except ConfigError as exc:
+        print(f"Configuration error: {exc}", file=sys.stderr)
+        return 2
     except ExportBotError as exc:
         logger.error("Export failed: %s", exc)
         return 1

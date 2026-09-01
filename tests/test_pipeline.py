@@ -11,7 +11,7 @@ import pandas as pd
 import pytest
 
 from src.exportbot.auth import Authenticator, TableauSession
-from src.exportbot.config import Config
+from src.exportbot.config import Config, ConfigError
 from src.exportbot.exceptions import ValidationError
 from src.exportbot.pipeline import run_pipeline
 from src.exportbot.tableau_client import TableauClient
@@ -35,14 +35,14 @@ class FakeTableauClient(TableauClient):
         return self._df
 
 
-def _make_config(export_dir: str) -> Config:
+def _make_config(export_dir: str, view_id: str = "view-1") -> Config:
     return Config(
         tableau_server_url="https://insight.example.com",
         tableau_site="",
         tableau_username="user",
         tableau_password="pass",
         tableau_api_version="",
-        view_id="view-1",
+        view_id=view_id,
         export_dir=export_dir,
         log_level="INFO",
     )
@@ -73,5 +73,24 @@ def test_run_pipeline_raises_on_invalid_data(tmp_path):
             config=config,
             authenticator=FakeAuthenticator(),
             client_factory=lambda session: FakeTableauClient(empty_df),
+            logger=logger,
+        )
+
+
+def test_run_pipeline_requires_view_id_before_authenticating(tmp_path):
+    """The full pipeline still needs TABLEAU_VIEW_ID -- unlike the auth
+    smoke test, which never calls run_pipeline at all."""
+    config = _make_config(str(tmp_path), view_id="")
+    logger = logging.getLogger("test")
+
+    class AuthenticatorThatMustNotBeCalled(Authenticator):
+        def authenticate(self, config: Config) -> TableauSession:
+            raise AssertionError("authenticate() should not be called before view_id is checked")
+
+    with pytest.raises(ConfigError, match="TABLEAU_VIEW_ID"):
+        run_pipeline(
+            config=config,
+            authenticator=AuthenticatorThatMustNotBeCalled(),
+            client_factory=lambda session: FakeTableauClient(pd.DataFrame()),
             logger=logger,
         )

@@ -7,7 +7,7 @@ username/password/token never appear in the returned message.
 from unittest.mock import patch
 
 from auth_smoke_test import run_smoke_test
-from src.exportbot.config import Config
+from src.exportbot.config import Config, load_config
 
 USERNAME = "smoke-test-user"
 PASSWORD = "smoke-test-password"
@@ -24,17 +24,41 @@ class FakeResponse:
         return self._json_body
 
 
-def _make_config() -> Config:
+def _make_config(view_id: str = "") -> Config:
+    """Defaults view_id to "" -- the smoke test must work without it."""
     return Config(
         tableau_server_url="https://insight.example.com",
         tableau_site="",
         tableau_username=USERNAME,
         tableau_password=PASSWORD,
         tableau_api_version="3.29",
-        view_id="view-1",
+        view_id=view_id,
         export_dir="exports",
         log_level="INFO",
     )
+
+
+def test_run_smoke_test_works_without_view_id_from_load_config(monkeypatch):
+    """Reproduces the reported bug: `python auth_smoke_test.py` must not
+    fail on a missing TABLEAU_VIEW_ID, since sign-in doesn't need it."""
+    for key in ["TABLEAU_SERVER_URL", "TABLEAU_USERNAME", "TABLEAU_PASSWORD", "TABLEAU_VIEW_ID"]:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("TABLEAU_SERVER_URL", "https://insight.example.com")
+    monkeypatch.setenv("TABLEAU_USERNAME", USERNAME)
+    monkeypatch.setenv("TABLEAU_PASSWORD", PASSWORD)
+    monkeypatch.setenv("TABLEAU_API_VERSION", "3.29")
+
+    config = load_config()  # must not raise despite TABLEAU_VIEW_ID being unset
+    assert config.view_id == ""
+
+    fake = FakeResponse(
+        status_code=200,
+        json_body={"credentials": {"token": FAKE_TOKEN, "site": {"id": "site-1"}}},
+    )
+    with patch("src.exportbot.auth.requests.post", return_value=fake):
+        success, message = run_smoke_test(config)
+
+    assert success is True
 
 
 def test_run_smoke_test_reports_success_without_leaking_token():
