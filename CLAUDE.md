@@ -39,6 +39,13 @@ Layered, each layer swappable via a small interface:
   column names) instead of the full DataFrame -- used by
   `extract_smoke_test.py` to check extraction works before wiring it into
   the real pipeline. Standalone; not yet wired into `main.py`.
+- `extraction_diagnostics.py` — `probe_with_accept_header()`, retries the
+  same "view data" GET with a caller-specified (or absent) `Accept`
+  header and reports HTTP status, content type, a small allowlist of
+  response headers, and a truncated error body -- used by
+  `diagnose_extraction.py` to isolate why a request fails (e.g. HTTP 406)
+  without guessing. Never raises, so every variant can be tried even if
+  one fails. Standalone; not yet wired into `main.py`.
 - `validation.py` — generic sanity checks on the DataFrame (not empty, has
   columns, not all-null) before export.
 - `exporter.py` — writes the DataFrame to
@@ -117,17 +124,35 @@ TABLEAU_VIEW_ID=<guid>` pasted whole into an existing `TABLEAU_VIEW_ID=`
 entry, i.e. `TABLEAU_VIEW_ID=TABLEAU_VIEW_ID=<guid>` in `.env`).
 `require_view_id()` now rejects a value containing `=` or the variable's
 own name with a clear `ConfigError` instead of silently building a broken
-URL — see `tests/test_view_id_flow.py`. A subsequent HTTP 406 is a
-separate question, not yet investigated, since the URL had to be fixed
-first.
+URL — see `tests/test_view_id_flow.py`.
+
+**With the URL fixed, the same request now returns HTTP 406 Not
+Acceptable** for
+`GET /api/3.29/sites/34494572-d6be-4fa1-8c4a-d4836d30345f/views/741ce0df-8818-4412-93ca-b34c03019219/data`.
+406 is specifically an HTTP content-negotiation status (RFC 7231 §6.5.6):
+the server declines to produce a representation matching the request's
+`Accept` header. Tableau's REST API signals authentication failures with
+401 and permission/authorization failures with 403 (typically with a
+Tableau-specific XML/JSON error code) — not 406 — so this points first at
+the `Accept: text/csv` header the current code sends
+(`extraction_probe.py`/`tableau_client.py`), not at credentials or the
+"Export Data" permission. That's not yet confirmed live, though:
+`diagnose_extraction.py` retries the identical request with `Accept:
+text/csv` (current), no `Accept` header at all, `application/json`, and
+`*/*`, reporting sanitized status/content-type/headers for each so the
+real cause (A: our Accept header is wrong, B: a genuine permission
+problem that happens to 406 on this server, or C: some other
+server/gateway-specific behavior) can be determined empirically instead
+of guessed. **Not yet run against the real server.**
 
 Still unverified (needs a machine with real access, i.e. not this
 sandbox):
 
+- Which `Accept` header (if any) the real server actually accepts for
+  this endpoint — `diagnose_extraction.py` has not been run there yet.
 - Whether the "view data" endpoint (`extraction_probe.py` /
   `extract_smoke_test.py`, same endpoint as `tableau_client.py`) actually
-  returns data for this view, and in what shape (CSV, content type, row
-  count). **Not yet run there — only mocked-response unit tests.**
+  returns data for this view once/if the 406 is resolved.
 - End-to-end `python main.py` run with real credentials and the real
   `TABLEAU_VIEW_ID`.
 
@@ -164,15 +189,24 @@ Tested in this environment (`pytest`, no network):
 - `extract_smoke_test.py` (CLI) — success/failure reporting, using mocked
   auth + view-data responses; confirms row values, the auth token, and
   credentials never appear in its output.
+- `extraction_diagnostics.py` — `probe_with_accept_header()`'s handling of
+  a 406 response, a 200 response, an unsafe header (`Set-Cookie`) being
+  excluded, and a network error, using mocked HTTP responses.
+- `diagnose_extraction.py` (CLI) — reports one sanitized line per Accept
+  variant tried, using a mocked server that 406s only on `Accept:
+  text/csv` (reproducing the reported symptom) and succeeds otherwise;
+  confirms credentials/token/row values never appear in its output.
 
 Not tested, requires a machine with access to `insight.erajaya.com`:
 - `discover_api_version()` against the real `serverinfo` endpoint (a user
   confirmed the endpoint itself works via manual `curl`, restApiVersion
   3.29 — but our function that calls and parses it has not been run
   against the live server yet).
+- `probe_with_accept_header()` / `diagnose_extraction.py` against the real
+  server — the 406 investigation is entirely unverified live so far.
 - `probe_view_data()` / `TableauServerClient.get_view_data()` against the
-  real server for view `741ce0df-8818-4412-93ca-b34c03019219` — not yet
-  attempted.
+  real server for view `741ce0df-8818-4412-93ca-b34c03019219` — blocked
+  on the 406 above.
 - End-to-end `python main.py` run with real credentials.
 
 ## Next steps
@@ -190,11 +224,17 @@ Not tested, requires a machine with access to `insight.erajaya.com`:
    `discover_view.py` resolved it to
    `741ce0df-8818-4412-93ca-b34c03019219` (workbook "Return & Rotate",
    view "Dashboard 1").
-4. Run `extract_smoke_test.py` from a machine with real access to confirm
-   the "view data" endpoint actually returns data for this view, and
-   check the reported shape (row/column counts, column names) against
-   what's expected.
-5. If that works, run `TableauServerClient.get_view_data()` (the
+4. ~~Run `extract_smoke_test.py` against the real server~~ — done, but it
+   returned HTTP 406, not data. Run `diagnose_extraction.py` next to
+   determine which `Accept` header (if any) the real server accepts for
+   this endpoint.
+5. Once a working `Accept` value (or its absence) is confirmed, update
+   `tableau_client.py`'s production `Accept: text/csv` header to match,
+   with a mocked regression test locking in the corrected header.
+6. Run `extract_smoke_test.py` again to confirm the "view data" endpoint
+   now returns data for this view, and check the reported shape
+   (row/column counts, column names) against what's expected.
+7. If that works, run `TableauServerClient.get_view_data()` (the
    production path) the same way; adjust `validation.py` if the real
    schema needs specific column checks.
-6. Only after that: run `python main.py` end-to-end.
+8. Only after that: run `python main.py` end-to-end.

@@ -18,12 +18,14 @@ main.py                        CLI entry point
 auth_smoke_test.py             Isolated sign-in check (no data extraction)
 discover_view.py               Isolated workbook/view GUID lookup (no data extraction)
 extract_smoke_test.py          Isolated view-data probe (metadata only, no row data printed)
+diagnose_extraction.py         Retries the view-data request with different Accept headers
 src/exportbot/
   config.py                    Env-var configuration loading
   auth.py                      Authenticator interface + Tableau REST sign-in
   tableau_client.py            TableauClient interface + REST view-data fetch
   view_discovery.py            Resolves a workbook/view name pair to its GUID
   extraction_probe.py          Probes view-data endpoint, reports shape metadata only
+  extraction_diagnostics.py    Retries view-data with different Accept headers, reports status/headers
   validation.py                Pre-export data checks
   exporter.py                  Excel export (date folder + timestamped file)
   pipeline.py                  Wires the above together
@@ -84,6 +86,14 @@ names — never row values, credentials, or tokens):
 
 ```bash
 python extract_smoke_test.py
+```
+
+If that fails with a non-200 status (e.g. HTTP 406), diagnose it by
+retrying with different `Accept` header values (still metadata only,
+never row data):
+
+```bash
+python diagnose_extraction.py
 ```
 
 ```bash
