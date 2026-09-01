@@ -70,13 +70,18 @@ auto-detection are both based on this), and that Tableau's `serverinfo`
 endpoint doesn't require the version in the request path to match the
 server's actual version.
 
+A user confirmed the login page is Tableau's native username/password
+form, not SSO/SAML — so `TABLEAU_USERNAME`/`TABLEAU_PASSWORD` sign-in
+against `/auth/signin` is the right flow (no browser-based login needed).
+
 Still unverified (needs a machine with real access, i.e. not this
 sandbox):
 
-- Whether `TABLEAU_USERNAME`/`TABLEAU_PASSWORD` sign-in works, or whether
-  the instance actually requires SSO/SAML (would need a different auth
-  flow, likely browser-based, if so). **No sign-in attempt has been made
-  yet — this is still unauthenticated.**
+- Whether `TABLEAU_USERNAME`/`TABLEAU_PASSWORD` sign-in actually succeeds
+  against `/auth/signin`. **No sign-in attempt has been made yet from
+  this environment.** `auth_smoke_test.py` is an isolated CLI for testing
+  exactly this (sign-in only, no data extraction, never prints
+  credentials/tokens — see "Running" in README.md).
 - Whether the "view data" endpoint returns the CSV shape assumed by
   `tableau_client.py`, or whether crosstab/export endpoints work better.
 - The real `TABLEAU_VIEW_ID` for `ReturnRotate/Dashboard1` (the URL only

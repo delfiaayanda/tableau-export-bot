@@ -93,3 +93,17 @@ class TableauServerAuthenticator(Authenticator):
             server_url=config.tableau_server_url,
             api_version=self.api_version,
         )
+
+
+def redact_secrets(message: str, config: Config) -> str:
+    """Strip any verbatim occurrence of configured credentials from a message.
+
+    Our own request/response handling never puts credentials into
+    exception text to begin with; this is a defense-in-depth guard in case
+    a server error page ever echoes the submitted username back.
+    """
+    redacted = message
+    for secret in (config.tableau_username, config.tableau_password):
+        if secret:
+            redacted = redacted.replace(secret, "[REDACTED]")
+    return redacted

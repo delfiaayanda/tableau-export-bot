@@ -12,6 +12,7 @@ See `CLAUDE.md` for details and what's left to verify.
 
 ```
 main.py                        CLI entry point
+auth_smoke_test.py             Isolated sign-in check (no data extraction)
 src/exportbot/
   config.py                    Env-var configuration loading
   auth.py                      Authenticator interface + Tableau REST sign-in
@@ -50,6 +51,15 @@ endpoint (`src/exportbot/serverinfo.py`); set it explicitly to skip that
 call.
 
 ## Running
+
+Before running the full pipeline, do an isolated authentication check
+(sign-in only, no data extraction, never prints credentials/tokens):
+
+```bash
+python auth_smoke_test.py
+```
+
+Prints `SUCCESS: ...` or `FAILURE: <sanitized status/message>`.
 
 ```bash
 python main.py
