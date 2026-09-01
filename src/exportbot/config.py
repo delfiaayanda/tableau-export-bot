@@ -21,6 +21,7 @@ class Config:
     tableau_site: str
     tableau_username: str
     tableau_password: str
+    tableau_api_version: str
     view_id: str
     export_dir: str
     log_level: str
@@ -51,6 +52,7 @@ def load_config() -> Config:
         tableau_site=os.environ.get("TABLEAU_SITE", ""),
         tableau_username=_require("TABLEAU_USERNAME"),
         tableau_password=_require("TABLEAU_PASSWORD"),
+        tableau_api_version=os.environ.get("TABLEAU_API_VERSION", "").strip(),
         view_id=_require("TABLEAU_VIEW_ID"),
         export_dir=os.environ.get("EXPORT_DIR", "exports"),
         log_level=os.environ.get("LOG_LEVEL", "INFO"),

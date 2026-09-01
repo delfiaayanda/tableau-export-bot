@@ -11,7 +11,13 @@ REQUIRED_VARS = {
 
 
 def _clear_env(monkeypatch):
-    for key in [*REQUIRED_VARS, "TABLEAU_SITE", "EXPORT_DIR", "LOG_LEVEL"]:
+    for key in [
+        *REQUIRED_VARS,
+        "TABLEAU_SITE",
+        "TABLEAU_API_VERSION",
+        "EXPORT_DIR",
+        "LOG_LEVEL",
+    ]:
         monkeypatch.delenv(key, raising=False)
 
 
@@ -35,6 +41,7 @@ def test_load_config_reads_all_required_vars(monkeypatch):
     assert config.tableau_password == REQUIRED_VARS["TABLEAU_PASSWORD"]
     assert config.view_id == REQUIRED_VARS["TABLEAU_VIEW_ID"]
     assert config.tableau_site == ""
+    assert config.tableau_api_version == ""
     assert config.export_dir == "exports"
     assert config.log_level == "INFO"
 
@@ -44,12 +51,14 @@ def test_load_config_applies_optional_overrides(monkeypatch):
     for key, value in REQUIRED_VARS.items():
         monkeypatch.setenv(key, value)
     monkeypatch.setenv("TABLEAU_SITE", "myproject")
+    monkeypatch.setenv("TABLEAU_API_VERSION", "3.29")
     monkeypatch.setenv("EXPORT_DIR", "/tmp/custom-exports")
     monkeypatch.setenv("LOG_LEVEL", "DEBUG")
 
     config = load_config()
 
     assert config.tableau_site == "myproject"
+    assert config.tableau_api_version == "3.29"
     assert config.export_dir == "/tmp/custom-exports"
     assert config.log_level == "DEBUG"
 

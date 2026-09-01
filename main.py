@@ -10,6 +10,7 @@ from src.exportbot.config import ConfigError, load_config
 from src.exportbot.exceptions import ExportBotError
 from src.exportbot.logging_setup import setup_logging
 from src.exportbot.pipeline import run_pipeline
+from src.exportbot.serverinfo import discover_api_version
 from src.exportbot.tableau_client import TableauServerClient
 
 
@@ -23,9 +24,16 @@ def main() -> int:
     logger = setup_logging(config.log_level)
 
     try:
+        if config.tableau_api_version:
+            api_version = config.tableau_api_version
+            logger.info("Using configured Tableau API version: %s", api_version)
+        else:
+            api_version = discover_api_version(config.tableau_server_url)
+            logger.info("Discovered Tableau API version via serverinfo: %s", api_version)
+
         run_pipeline(
             config=config,
-            authenticator=TableauServerAuthenticator(),
+            authenticator=TableauServerAuthenticator(api_version=api_version),
             client_factory=lambda session: TableauServerClient(session),
             logger=logger,
         )

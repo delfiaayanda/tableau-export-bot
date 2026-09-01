@@ -41,6 +41,7 @@ def _make_config(export_dir: str) -> Config:
         tableau_site="",
         tableau_username="user",
         tableau_password="pass",
+        tableau_api_version="",
         view_id="view-1",
         export_dir=export_dir,
         log_level="INFO",

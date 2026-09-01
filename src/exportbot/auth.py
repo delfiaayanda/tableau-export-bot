@@ -21,7 +21,7 @@ import requests
 from .config import Config
 from .exceptions import AuthenticationError
 
-DEFAULT_API_VERSION = "3.22"
+DEFAULT_API_VERSION = "3.29"  # confirmed via serverinfo against the real server
 
 
 @dataclass(frozen=True)

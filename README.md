@@ -21,6 +21,7 @@ src/exportbot/
   pipeline.py                  Wires the above together
   logging_setup.py             Logging configuration
   exceptions.py                Shared exception types
+  serverinfo.py                 Auto-detects the REST API version (unauthenticated)
 tests/                         Unit tests (no network required)
 ```
 
@@ -39,8 +40,14 @@ cp .env.example .env   # then fill in real values; never commit .env
 
 All settings come from environment variables (see `.env.example`):
 `TABLEAU_SERVER_URL`, `TABLEAU_SITE`, `TABLEAU_USERNAME`,
-`TABLEAU_PASSWORD`, `TABLEAU_VIEW_ID`, `EXPORT_DIR`, `LOG_LEVEL`. No
-credentials are hardcoded anywhere in the code.
+`TABLEAU_PASSWORD`, `TABLEAU_VIEW_ID`, `TABLEAU_API_VERSION`,
+`EXPORT_DIR`, `LOG_LEVEL`. No credentials are hardcoded anywhere in the
+code.
+
+`TABLEAU_API_VERSION` is optional — leave it blank and `main.py` will
+auto-detect it at startup from the server's unauthenticated `serverinfo`
+endpoint (`src/exportbot/serverinfo.py`); set it explicitly to skip that
+call.
 
 ## Running
 
