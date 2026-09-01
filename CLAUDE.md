@@ -252,19 +252,80 @@ probe**, not a claim that it matches the browser's actual request --
 8. The "Initiator" column/tab for that request can hint at which part of
    Tableau's JS triggered it, useful context but not required.
 
-Once that's captured, tell me the sanitized shape (method, path, which
-headers were present, response `Content-Type`/`Content-Disposition`) and
-`crosstab_probe.py` will be adjusted (or a cookie-based variant added) to
-match it exactly -- rather than continuing to guess.
+**A user captured a real HAR file of the "Download -> Crosstab" click and
+shared it locally (never committed).** Inspecting it (structurally --
+every cookie, token, and session id value was redacted before being
+looked at; one session id was accidentally printed in an intermediate
+debugging step in this environment, never committed or exposed
+elsewhere) revealed the real flow, 10 requests:
+
+```
+POST /vizql/w/{workbook}/v/{view}/sessions/{id}/commands/tabdoc/launch-hybrid-view-data-dialog
+POST /vizportal/api/web/v1/reportEventUnauthenticated          (telemetry, not part of the export)
+POST /vizql/w/{workbook}/v/{view}/sessions/{id}/commands/tabdoc/view-data-dialog-show-aliases
+POST /vizql/w/{workbook}/v/{view}/sessions/{id}/commands/tabsrv/get-view-data-csvexport-settings-server
+POST /vizql/w/{workbook}/v/{view}/sessions/{id}/commands/tabdoc/get-view-data-dialog-tab-pres-model
+POST /vizql/w/{workbook}/v/{view}/sessions/{id}/commands/tabsrv/export-view-data-summary-to-csv-server
+GET  /vizql/w/{workbook}/v/{view}/tempfile/sessions/{id}?key={resultKey}&keepfile=yes&attachment=yes
+```
+
+Findings:
+
+1. **Session establishment**: NOT visible in this HAR. The VizQL session
+   id (in every URL path) and a `visualIdPresModel` identifier are both
+   already present on the *first* captured request -- both are minted
+   during the browser's interactive page load/bootstrap, before this
+   capture started. Cannot be derived from any REST call this project
+   has.
+2. **Headers on every VizQL call**: `X-XSRF-TOKEN` (anti-CSRF, present on
+   all of them). **No `X-Tableau-Auth` header appears anywhere.** No
+   `Cookie` header is visible either, but that's almost certainly
+   Chrome's own HAR-export privacy redaction (strips cookies/auth by
+   default), not evidence that no cookie is used.
+3. **Request bodies** (`multipart/form-data`; field *names* confirmed
+   directly from the HAR):
+   - `get-view-data-csvexport-settings-server`: just `telemetryCommandId`
+   - `export-view-data-summary-to-csv-server`: `visualIdPresModel`,
+     `showAliases` (`"true"`), `columns` (JSON array of column-name
+     strings), `listSeparatorValue` (`","`), `unicodeEncodingValue`
+     (`"UTF-8"`), `telemetryCommandId`
+4. **Session id origin**: unknown -- established before this capture
+   began (see point 1).
+5. **Can existing REST auth (`X-Tableau-Auth`) establish this session?**
+   Based on direct evidence: **no** -- it's absent from all 10 requests.
+   This is architecturally a separate, cookie/session-based mechanism
+   from the public REST API.
+6. **Tokens confirmed required**: `X-XSRF-TOKEN` header (present,
+   value never inspected); very likely a session cookie too (redacted by
+   Chrome before we ever saw the file).
+7. **Tempfile URL reproducibility**: the `key` query parameter is minted
+   server-side and returned in the export command's own JSON response, at
+   `vqlCmdResponse.layoutStatus.applicationPresModel
+   .presentationLayerNotification[0].presModelHolder
+   .genExportFilePresModel.resultKey` (found by walking the actual
+   response structure -- not documented anywhere). The same object also
+   carries `fileName` and `mimeType`, confirming the user-reported
+   `Persentase Nasional_data.csv` / `text/csv` result exactly.
+
+**The hard blocker**: `visualIdPresModel` and the session id are both
+minted client-side during interactive page rendering. Without a browser
+(or a full reproduction of Tableau's cookie-based web login + bootstrap,
+which is a bigger, separate decision -- see "Next steps"), this project
+cannot obtain them on its own. `src/exportbot/vizql_crosstab_probe.py` /
+`vizql_crosstab_probe.py` (CLI) were built to test the one thing that
+*is* answerable without solving that: given an already-valid session id
+and visual context (pasted fresh from a DevTools capture as
+`TABLEAU_VIZQL_SESSION_ID` / `TABLEAU_VIZQL_VISUAL_ID_PRES_MODEL` /
+`TABLEAU_VIZQL_COLUMNS_JSON` env vars -- never committed, expire
+quickly), can the export-command -> tempfile-download tail of the flow
+be reproduced with plain `requests`? **Not yet run against the real
+server.**
 
 Still unverified (needs a machine with real access, i.e. not this
 sandbox):
 
-- What request Tableau's own browser UI generates for "Download ->
-  Crosstab" -- requires the DevTools capture above.
-- Which `Accept` header (if any) the real server actually accepts for
-  `/data` or `/crosstab/excel` -- the extended `diagnose_extraction.py`
-  has not been run there yet.
+- Whether `vizql_crosstab_probe.py`, given a live session id pasted from
+  DevTools, can actually reproduce the export + tempfile download.
 - Whether the documented `/crosstab/excel` REST endpoint (as opposed to
   whatever the browser calls) behaves any differently than `/data` for
   this specific dashboard view -- `crosstab_probe.py` has not been run
@@ -327,6 +388,18 @@ Tested in this environment (`pytest`, no network):
 - `crosstab_probe.py` (CLI) — success/failure reporting, using mocked
   auth + crosstab responses; confirms credentials, the auth token, and
   file contents never appear in its output.
+- `vizql_crosstab_probe.py` (module) — `check_session()`,
+  `export_view_data_summary_to_csv()` (field names sent, result key/
+  filename/mimeType extraction from the real captured JSON response
+  shape, malformed-response handling, network errors), and
+  `fetch_tempfile()` (metadata extraction, network errors), using mocked
+  HTTP responses; confirms the session id and export result key are
+  never surfaced in any returned object.
+- `vizql_crosstab_probe.py` (CLI) — reports "session established: no"
+  and makes **zero** network calls when the required ephemeral context
+  isn't supplied; full success/failure reporting otherwise, using mocked
+  responses shaped like the real captured JSON; confirms the session id,
+  export result key, and row values never appear in its output.
 
 Not tested, requires a machine with access to `insight.erajaya.com`:
 - `discover_api_version()` against the real `serverinfo` endpoint (a user
@@ -341,6 +414,11 @@ Not tested, requires a machine with access to `insight.erajaya.com`:
 - `probe_view_data()` / `TableauServerClient.get_view_data()` against the
   real server for view `741ce0df-8818-4412-93ca-b34c03019219` — blocked
   on the 406/timeout above.
+- `vizql_crosstab_probe.py` against the real server with a live,
+  DevTools-captured session id — entirely unverified; we don't yet know
+  if the export/tempfile commands succeed when reproduced via plain
+  `requests` instead of a real browser (e.g. TLS fingerprinting, header
+  ordering, or other browser-specific signals could still block it).
 - End-to-end `python main.py` run with real credentials.
 
 ## Next steps
@@ -371,31 +449,45 @@ Not tested, requires a machine with access to `insight.erajaya.com`:
 7. ~~The user confirmed visually that the dashboard's UI has a native
    "Download -> Crosstab" menu~~ — done. This does not by itself confirm
    which backend endpoint it calls; that requires the DevTools capture
-   documented above. **Do the DevTools capture next** and report back the
-   sanitized request shape (method, path, header names, response
-   Content-Type/Content-Disposition).
+   documented above.
 8. Run `crosstab_probe.py` from a machine with real access, to test the
-   one endpoint we can concretely name (the documented REST
-   `/crosstab/excel`) independently of the DevTools capture.
-9. Once the real browser request is known (step 7) and/or a working
-   endpoint+Accept combination is confirmed (steps 6/8), decide the
-   extraction method:
-   - If a REST endpoint (`/data` or `/crosstab/excel`) works via our
-     existing `X-Tableau-Auth` session, that's the method — update
-     `tableau_client.py` to match, with a mocked regression test locking
-     in the correction.
-   - If only the browser's internal cookie-session endpoint works, that
-     changes the auth model entirely (cookie-based, not token-based) and
-     needs a new, explicit decision before any code is written for it.
-   - If everything still times out or 403s regardless of endpoint, that
-     points to (B)/(C) — a permission or server/gateway-level issue,
-     worth checking with a Tableau admin (does this account have "Export
-     Data"/"Download Crosstab" on this specific workbook?).
-10. Run `extract_smoke_test.py` (or the equivalent for whichever endpoint
+   documented REST `/crosstab/excel` endpoint.
+9. ~~Capture the real browser "Download -> Crosstab" request~~ — done, via
+   a HAR file. It's VizQL session commands
+   (`/vizql/w/{workbook}/v/{view}/sessions/{id}/commands/...`),
+   cookie/`X-XSRF-TOKEN`-authenticated, NOT the REST API. Full analysis
+   above. `vizql_crosstab_probe.py` was built to test reproducing the
+   export+tempfile tail of that flow given a live, DevTools-pasted
+   session id.
+10. Run `vizql_crosstab_probe.py` from a machine with real access,
+    immediately after a fresh DevTools capture (the session id expires
+    quickly). Depending on the result, decide the extraction method:
+    - If it succeeds, that confirms the VizQL tail is reproducible via
+      plain `requests` given a valid session -- but a full pipeline still
+      needs a way to *obtain* that session (id + visualIdPresModel)
+      without a human doing it via DevTools each time. That means either
+      reproducing Tableau's cookie-based web login + page bootstrap (a
+      new, non-trivial auth model -- needs an explicit decision before
+      writing that code) or browser automation (Playwright) to drive the
+      real login + click flow. Neither should be started without
+      checking in first, per the priority order in the original
+      investigation (REST > authenticated HTTP > Playwright > full
+      browser automation).
+    - If it fails even with a valid session (e.g. still times out, or
+      403s), that's a strong signal of something more fundamental --
+      TLS/header fingerprinting, IP/network-based gating, or a genuine
+      permission gap on "Export Data"/"Download Crosstab" for this
+      account on this workbook -- worth checking with a Tableau admin.
+    - Separately, if `crosstab_probe.py` (step 8) or the extended
+      `diagnose_extraction.py` (step 6) succeed via the plain REST API,
+      that's a simpler method than VizQL reproduction and should be
+      preferred -- update `tableau_client.py` to match, with a mocked
+      regression test locking in the correction.
+11. Run `extract_smoke_test.py` (or the equivalent for whichever endpoint
     was confirmed) again to see real data come back, and check the
     reported shape (row/column counts, column names) against what's
     expected.
-11. If that works, run `TableauServerClient.get_view_data()` (the
+12. If that works, run `TableauServerClient.get_view_data()` (the
     production path) the same way; adjust `validation.py` if the real
     schema needs specific column checks.
-12. Only after that: run `python main.py` end-to-end.
+13. Only after that: run `python main.py` end-to-end.

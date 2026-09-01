@@ -20,6 +20,7 @@ discover_view.py               Isolated workbook/view GUID lookup (no data extra
 extract_smoke_test.py          Isolated view-data probe (metadata only, no row data printed)
 diagnose_extraction.py         Retries the view-data request with different Accept headers
 crosstab_probe.py              Isolated probe of the documented crosstab-Excel REST endpoint
+vizql_crosstab_probe.py        Experimental: reproduces the browser's native VizQL Crosstab export
 src/exportbot/
   config.py                    Env-var configuration loading
   auth.py                      Authenticator interface + Tableau REST sign-in
@@ -28,6 +29,7 @@ src/exportbot/
   extraction_probe.py          Probes view-data endpoint, reports shape metadata only
   extraction_diagnostics.py    Retries view-data with different Accept headers, reports status/headers
   crosstab_probe.py            Probes the crosstab-Excel endpoint, reports status/size/filename only
+  vizql_crosstab_probe.py      Reproduces the VizQL export+tempfile commands given a live session
   validation.py                Pre-export data checks
   exporter.py                  Excel export (date folder + timestamped file)
   pipeline.py                  Wires the above together
@@ -111,6 +113,25 @@ filename only -- never the file's contents):
 
 ```bash
 python crosstab_probe.py
+```
+
+**Update: a real browser HAR capture confirmed the native "Download ->
+Crosstab" menu does NOT use the REST API at all.** It calls Tableau's
+internal VizQL session commands (`/vizql/w/{workbook}/v/{view}/sessions/
+{id}/commands/...`), authenticated via a browser session (cookie +
+`X-XSRF-TOKEN`), not `X-Tableau-Auth`. See "Native UI Crosstab download"
+in `CLAUDE.md` for the full analysis. `vizql_crosstab_probe.py` is an
+experimental, isolated reproduction of the export+download tail of that
+flow — it cannot establish a session on its own (the session id and a
+per-visual identifier are minted during the browser's page load, not
+derivable via REST), so it requires those values pasted fresh from a
+DevTools capture as environment variables
+(`TABLEAU_VIZQL_SESSION_ID`, `TABLEAU_VIZQL_VISUAL_ID_PRES_MODEL`,
+`TABLEAU_VIZQL_COLUMNS_JSON`) — never commit or reuse them, they expire
+quickly:
+
+```bash
+python vizql_crosstab_probe.py
 ```
 
 ```bash
