@@ -19,16 +19,28 @@ directly"):
     clicking it again just hangs, it does not trigger anything.
 
 Instead, this reproduces Tableau's own VizQL command flow directly, per
-the HAR capture in CLAUDE.md ("Native UI Crosstab download"): opening the
-View Data dialog (the "Data" click, kept) already fires four VizQL
-bootstrap commands automatically, with no further click needed
-(`launch-hybrid-view-data-dialog`, `view-data-dialog-show-aliases`,
-`get-view-data-csvexport-settings-server`, `get-view-data-dialog-tab-pres-model`).
+the HAR capture in CLAUDE.md ("Native UI Crosstab download").
 `_attach_vizql_bootstrap_listeners()` passively captures the VizQL
-session id (from the URL path every one of those already carries), the
-`visualIdPresModel` value and `columns` list (from within their response
-bodies -- exact field names confirmed by the HAR), and the
-`X-XSRF-TOKEN` header value (from the requests themselves) as they fire.
+session id (from the URL path of any command -- every VizQL command's
+URL carries it), the `visualIdPresModel` value and `columns` list (from
+within command response bodies -- exact field names confirmed by the
+HAR), and the `X-XSRF-TOKEN` header value (from the requests
+themselves), as they fire. It is attached right after the dashboard
+navigation, in `run_browser_crosstab_export()` -- *not* right before the
+"Data" click. An earlier version attached it there, on the assumption
+that click alone is what fires Tableau's bootstrap VizQL commands; a
+real-server run timed out waiting for that capture to complete. Any
+interactive Tableau viz has to establish its own VizQL session just to
+render at all, so that session's id and XSRF token are already carried
+on commands fired during the dashboard's *own* initial load, well before
+"Data" is ever clicked -- attaching only around that click starts
+listening after the traffic that actually carries them. Opening the View
+Data dialog (the "Data" click, kept) additionally fires four more VizQL
+bootstrap commands of its own with no further click needed
+(`launch-hybrid-view-data-dialog`, `view-data-dialog-show-aliases`,
+`get-view-data-csvexport-settings-server`, `get-view-data-dialog-tab-pres-model`),
+giving more chances to observe `visualIdPresModel`/`columns` if the
+dashboard's own load didn't already carry them.
 `_export_view_data_via_vizql_commands()` then issues the final two HAR
 steps itself -- POST `export-view-data-summary-to-csv-server`, GET the
 resulting `tempfile` URL -- via the browser's own authenticated request
@@ -110,7 +122,12 @@ TEMPFILE_URL_SUBSTRING = "/tempfile/"
 # opened. Used to passively capture the session id, visualIdPresModel,
 # columns, and X-XSRF-TOKEN needed to issue the export command ourselves.
 VIZQL_COMMAND_URL_SUBSTRING = "/commands/"
-VIZQL_SESSION_ID_RE = re.compile(r"/vizql/(w/[^/]+/v/[^/]+)/sessions/([^/?]+)/")
+# The leading "t/{site}/" segment is Tableau's own documented convention
+# for a non-default site (omitted entirely for the Default site, which
+# is what every URL confirmed so far in this project -- e.g. the plain
+# `/#/views/...` dashboard URL -- is consistent with); made optional here
+# rather than assumed, so this still matches if TABLEAU_SITE is set.
+VIZQL_SESSION_ID_RE = re.compile(r"/vizql/((?:t/[^/]+/)?w/[^/]+/v/[^/]+)/sessions/([^/?]+)/")
 VISUAL_ID_PRES_MODEL_KEY = "visualIdPresModel"
 COLUMNS_KEY = "columns"
 XSRF_HEADER_NAME = "x-xsrf-token"
@@ -392,7 +409,7 @@ def _save_tempfile_response(response, export_dir: Path) -> Path:
     return target_path
 
 
-def _export_crosstab_csv(page, export_dir: Path):
+def _export_crosstab_csv(page, capture: _ViewDataSessionCapture, export_dir: Path):
     def scopes():
         return [page, *page.frames]
 
@@ -415,14 +432,18 @@ def _export_crosstab_csv(page, export_dir: Path):
         _save_debug_screenshot(page, export_dir, "data-menuitem-not-found")
         raise BrowserAutomationError("Could not find the 'Data' item in the Download menu.")
 
-    # Attach the diagnostic export/tempfile logger (unchanged from before)
-    # and the new VizQL bootstrap-context capture BEFORE the click below --
-    # per the HAR, that click is what makes Tableau's own JS immediately
-    # fire the four bootstrap commands this capture needs to observe (see
-    # module docstring). Attaching any later risks missing them.
+    # `capture` is populated by listeners attached back in
+    # run_browser_crosstab_export(), right after the dashboard navigation
+    # -- NOT here, and not right before this click. An earlier version
+    # attached them here, immediately before the "Data" click, on the
+    # assumption that click alone is what fires Tableau's bootstrap VizQL
+    # commands. A real-server run timed out waiting for that capture,
+    # which never completed: the VizQL session backing an interactive
+    # Tableau viz is established during the *dashboard's own* initial
+    # load (any viz needs a live session to render at all), so listening
+    # only from the "Data" click onward starts after that traffic already
+    # happened. Attaching earlier catches it.
     _attach_export_network_diagnostics([page])
-    capture = _ViewDataSessionCapture()
-    _attach_vizql_bootstrap_listeners(page.context, capture)
 
     # Clicking "Data" opens a separate "View Data" popup window/tab (a new
     # Playwright Page in the same browser context, titled
@@ -929,9 +950,22 @@ def run_browser_crosstab_export(
             _login_if_needed(page, username, password)
 
             page.goto(DASHBOARD_URL, wait_until="domcontentloaded", timeout=GOTO_TIMEOUT_MS)
+
+            # Attach the VizQL bootstrap capture here -- right after this
+            # navigation, before even _wait_for_dashboard() -- not later,
+            # right before the "Data" click, as an earlier version did.
+            # Any interactive Tableau viz must establish its own VizQL
+            # session during this initial load just to render, so its
+            # session id/XSRF token are already carried on commands fired
+            # during this load; attaching only around the "Data" click
+            # starts listening after that traffic already happened. See
+            # CLAUDE.md, "Reproducing the export command directly".
+            capture = _ViewDataSessionCapture()
+            _attach_vizql_bootstrap_listeners(context, capture)
+
             _wait_for_dashboard(page)
             print("Dashboard loaded.")
 
-            return _export_crosstab_csv(page, export_dir_path)
+            return _export_crosstab_csv(page, capture, export_dir_path)
         finally:
             browser.close()

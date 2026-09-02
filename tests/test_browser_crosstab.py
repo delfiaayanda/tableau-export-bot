@@ -616,16 +616,18 @@ def test_export_crosstab_csv_full_flow_reproduces_vizql_export_commands(tmp_path
     issuing Tableau's own VizQL commands directly -- see the module
     docstring in browser_crosstab.py for why every DOM-based approach
     (the popup's own empty DOM, the main dashboard's Download button
-    blocked by Tableau's own dialog-glass overlay) was ruled out."""
+    blocked by Tableau's own dialog-glass overlay) was ruled out.
+
+    `capture` is passed in already complete, matching production: it's
+    now populated by listeners attached in run_browser_crosstab_export()
+    right after the dashboard navigation, not by _export_crosstab_csv()
+    itself -- see test_run_browser_crosstab_export_attaches_vizql_bootstrap_listeners_before_wait_for_dashboard
+    for that earlier-attachment behavior."""
     download_btn = FakeLocator()
     data_item = FakeLocator()
     popup = ViewDataPopupPage()
+    capture = _make_completed_capture()
 
-    bootstrap_request = FakeRequest(url=BOOTSTRAP_URL, headers={"x-xsrf-token": "xsrf-value-123"})
-    bootstrap_response = FakeAPIResponse(
-        url=BOOTSTRAP_URL,
-        json_body={"nested": {"visualIdPresModel": "visual-abc", "columns": ["Product", "Region"]}},
-    )
     export_response = FakeAPIResponse(url=EXPORT_COMMAND_URL, json_body={"resultKey": "KEY123"})
     tempfile_response = FakeAPIResponse(
         url=TEMPFILE_URL,
@@ -633,14 +635,10 @@ def test_export_crosstab_csv_full_flow_reproduces_vizql_export_commands(tmp_path
         body=b"Product,Region\nWidget,East\n",
     )
     request_ctx = FakeAPIRequestContext(post_response=export_response, get_response=tempfile_response)
-    context = FakeBrowserContext(
-        request_context=request_ctx,
-        bootstrap_request=bootstrap_request,
-        bootstrap_response=bootstrap_response,
-    )
+    context = FakeBrowserContext(request_context=request_ctx)
     page = ScriptedPage(script=[download_btn, data_item], popup=popup, context=context)
 
-    result = _export_crosstab_csv(page, tmp_path)
+    result = _export_crosstab_csv(page, capture, tmp_path)
 
     download_btn.click.assert_called_once()
     data_item.click.assert_called_once()
@@ -665,7 +663,7 @@ def test_export_crosstab_csv_full_flow_reproduces_vizql_export_commands(tmp_path
 def test_export_crosstab_csv_raises_and_screenshots_when_download_button_missing(tmp_path):
     page = ScriptedPage(script=[])
     with pytest.raises(BrowserAutomationError, match="Download toolbar button"):
-        _export_crosstab_csv(page, tmp_path)
+        _export_crosstab_csv(page, _ViewDataSessionCapture(), tmp_path)
     page.screenshot.assert_called_once()
 
 
@@ -673,7 +671,7 @@ def test_export_crosstab_csv_raises_when_data_menuitem_missing(tmp_path):
     download_btn = FakeLocator()
     page = ScriptedPage(script=[download_btn])  # data item absent
     with pytest.raises(BrowserAutomationError, match="'Data' item"):
-        _export_crosstab_csv(page, tmp_path)
+        _export_crosstab_csv(page, _ViewDataSessionCapture(), tmp_path)
     page.screenshot.assert_called_once()
 
 
@@ -686,7 +684,7 @@ def test_export_crosstab_csv_raises_when_view_data_popup_does_not_open(tmp_path)
     page = ScriptedPage(script=[download_btn, data_item], popup=None)
 
     with pytest.raises(BrowserAutomationError, match="View Data' popup window did not open"):
-        _export_crosstab_csv(page, tmp_path)
+        _export_crosstab_csv(page, _ViewDataSessionCapture(), tmp_path)
     page.screenshot.assert_called_once()
 
 
@@ -1031,9 +1029,62 @@ def test_run_browser_crosstab_export_orchestrates_and_closes_browser(tmp_path):
     )
     mock_login.assert_called_once_with(fake_page, "user", "pass")
     mock_wait.assert_called_once_with(fake_page)
-    mock_export.assert_called_once_with(fake_page, tmp_path)
+    mock_export.assert_called_once()
+    export_call_args = mock_export.call_args.args
+    assert export_call_args[0] is fake_page
+    assert isinstance(export_call_args[1], _ViewDataSessionCapture)
+    assert export_call_args[2] == tmp_path
     fake_browser.close.assert_called_once()
     fake_chromium.launch.assert_called_once_with(headless=True)
+
+
+def test_run_browser_crosstab_export_attaches_vizql_bootstrap_listeners_before_wait_for_dashboard(tmp_path):
+    """The fix for a real-server timeout: an earlier version attached the
+    VizQL bootstrap capture right before the "Data" click, inside
+    _export_crosstab_csv() -- too late, since a Tableau viz establishes
+    its VizQL session during the dashboard's own initial load, not when
+    the View Data dialog is opened. It must now be attached right after
+    the dashboard navigation, before _wait_for_dashboard() -- this test
+    pins that ordering via a shared call-order mock so a future change
+    can't silently move it later again."""
+    manager = MagicMock()
+    fake_browser = manager.browser
+    fake_context = manager.context
+    fake_page = manager.page
+    fake_context.new_page.return_value = fake_page
+    fake_browser.new_context.return_value = fake_context
+
+    fake_chromium = MagicMock()
+    fake_chromium.launch.return_value = fake_browser
+    fake_driver = MagicMock()
+    fake_driver.chromium = fake_chromium
+    fake_cm = MagicMock()
+    fake_cm.__enter__.return_value = fake_driver
+    fake_cm.__exit__.return_value = False
+
+    with patch("playwright.sync_api.sync_playwright", return_value=fake_cm):
+        with patch("src.exportbot.browser_crosstab._login_if_needed"):
+            with patch(
+                "src.exportbot.browser_crosstab._wait_for_dashboard", side_effect=manager.wait_for_dashboard
+            ):
+                with patch(
+                    "src.exportbot.browser_crosstab._export_crosstab_csv",
+                    return_value=tmp_path / "x.csv",
+                ):
+                    run_browser_crosstab_export(
+                        server_url="https://insight.example.com",
+                        username="user",
+                        password="pass",
+                        export_dir=str(tmp_path),
+                        headless=True,
+                    )
+
+    on_call_names = [
+        name
+        for name, _args, _kwargs in manager.mock_calls
+        if name in ("context.on", "wait_for_dashboard")
+    ]
+    assert on_call_names == ["context.on", "context.on", "wait_for_dashboard"]
 
 
 def test_run_browser_crosstab_export_passes_executable_path(tmp_path):

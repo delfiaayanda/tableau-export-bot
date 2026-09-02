@@ -745,6 +745,52 @@ booleans -- whether each piece was captured -- and response
 status/Content-Type, never the actual values) are the next thing to
 share back.
 
+**A user then ran this against the real server and it timed out**:
+`Timed out waiting to observe Tableau's own View Data bootstrap VizQL
+commands`. Nothing was captured at all. Root cause: the bootstrap
+listeners were attached inside `_export_crosstab_csv()`, immediately
+before the "Data" click, on the assumption that click alone is what
+fires Tableau's VizQL bootstrap commands. But a VizQL session isn't
+specific to the View Data dialog -- any interactive Tableau viz has to
+establish its own VizQL session just to render at all, and that
+session's id and `X-XSRF-TOKEN` are already carried on commands fired
+during the *dashboard's own* initial load, well before "Data" is ever
+clicked. Attaching only around that click starts listening after the
+traffic that actually carries the session context already happened, so
+the capture could never complete.
+
+Fixed by moving `_attach_vizql_bootstrap_listeners()` out of
+`_export_crosstab_csv()` and into `run_browser_crosstab_export()`,
+attached right after the dashboard navigation (`page.goto(DASHBOARD_URL,
+...)`), before even `_wait_for_dashboard()` -- as early as this project
+can possibly listen. `_export_crosstab_csv()` now takes the resulting
+`capture` object as a parameter instead of creating its own. The View
+Data dialog's own four bootstrap commands (still fired by the kept
+"Data" click) remain a second chance to observe `visualIdPresModel`/
+`columns` if the dashboard's own load didn't already carry them, since
+`_wait_for_view_data_session_capture()` (unchanged, still polling, no
+fixed sleep) is still called before issuing the export command.
+
+Separately, `VIZQL_SESSION_ID_RE` was broadened to tolerate an optional
+`t/{site}/` segment (`/vizql/(?:t/[^/]+/)?w/.../v/.../sessions/...`) --
+Tableau's own documented URL convention for a non-default site, omitted
+only for the Default site. This project has not confirmed which applies
+here (the plain `/#/views/...` dashboard URL suggests the Default site,
+but `TABLEAU_SITE` may be set), so the regex now accepts either rather
+than assuming -- a low-risk generalization of a known Tableau convention,
+not a guess about this server's specific response shapes.
+
+Regression tests were updated to match: `_export_crosstab_csv()` now
+takes `capture` as a parameter (tests pass a pre-populated one for the
+success path, and an empty one for the error paths that fail before
+reaching capture-dependent code), and a new
+`test_run_browser_crosstab_export_attaches_vizql_bootstrap_listeners_before_wait_for_dashboard`
+pins the corrected ordering (`context.on` called twice, then
+`_wait_for_dashboard`) via a shared call-order mock, so a future change
+can't silently move the attachment later again. **Still not run against
+the real server** -- the next run is what will show whether attaching
+this early actually captures the session context in practice.
+
 ## What is tested vs. not
 
 Tested in this environment (`pytest`, no network):
