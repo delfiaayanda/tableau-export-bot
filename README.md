@@ -178,9 +178,16 @@ python browser_crosstab.py
 
 Prints step-by-step progress (`Opening Tableau...`, `Logging in...`,
 `Dashboard loaded.`, `Opening Download menu...`, `Opening Data...`,
-`Exporting Crosstab...`) and finally `SUCCESS: <path to saved CSV>` in
-`EXPORT_DIR`, or `FAILURE: ...` — never prints the password, cookies, or
-any session/auth token.
+`Exporting Crosstab...`) and finally `SUCCESS: <path to saved CSV>`, or
+`FAILURE: ...` — never prints the password, cookies, or any
+session/auth token.
+
+The CSV is saved to `<EXPORT_DIR>/<YYYY-MM-DD>/<filename>` — the same
+date-folder convention `exporter.py` uses for the REST pipeline's Excel
+output. This matters for running it daily: Tableau's own filename (via
+`Content-Disposition`) doesn't include a date, so without this folder a
+second run on the same day would overwrite the first, but every day
+still gets its own subfolder.
 
 Set `HEADLESS=false` in `.env` to watch it run in a visible browser
 window while debugging. The DOM selectors it uses are best-effort
