@@ -17,14 +17,19 @@ import pytest
 from src.exportbot.browser_crosstab import (
     _TempfileCapture,
     _attach_export_network_diagnostics,
+    _attach_message_listener,
+    _attach_popup_runtime_diagnostics,
     _capture_tempfile_response,
+    _debug_dump_hydration_signals,
     _debug_dump_view_data_popup,
+    _describe_locator,
     _export_crosstab_csv,
     _extract_filename_from_content_disposition,
     _find_first,
     _inspect_frame,
     _is_export_related_url,
     _login_if_needed,
+    _read_hydration_signals,
     _redact_url,
     _sanitize_filename,
     _save_tempfile_response,
@@ -401,6 +406,106 @@ def test_debug_dump_view_data_popup_reports_per_frame_evaluate_failure(tmp_path,
 
     out = capsys.readouterr().out
     assert "evaluate() failed" in out
+
+
+class EvaluatePage(FakeEventPage):
+    """Fake supporting a scriptable .evaluate() -- used to test the
+    postMessage/opener/window.name hydration diagnostics, which need a
+    page that can return a specific JS-shaped result rather than the
+    click-oriented ScriptedPage/ViewDataPopupPage fakes."""
+
+    def __init__(self, evaluate_result=None, evaluate_raises=False, on_raises=False):
+        super().__init__(on_raises=on_raises)
+        self._evaluate_result = evaluate_result
+        self._evaluate_raises = evaluate_raises
+
+    def evaluate(self, script):
+        if self._evaluate_raises:
+            raise RuntimeError("evaluate failed")
+        return self._evaluate_result
+
+
+def test_attach_message_listener_never_raises_when_evaluate_fails():
+    page = EvaluatePage(evaluate_raises=True)
+    _attach_message_listener(page)  # must not raise
+
+
+def test_read_hydration_signals_returns_evaluate_result():
+    page = EvaluatePage(evaluate_result={"hasOpener": True, "windowNameLength": 0, "messages": []})
+    signals = _read_hydration_signals(page)
+    assert signals == {"hasOpener": True, "windowNameLength": 0, "messages": []}
+
+
+def test_read_hydration_signals_never_raises_when_evaluate_fails():
+    page = EvaluatePage(evaluate_raises=True)
+    signals = _read_hydration_signals(page)
+    assert "error" in signals
+
+
+def test_debug_dump_hydration_signals_reports_messages_without_leaking_payload(capsys):
+    page = EvaluatePage(
+        evaluate_result={
+            "hasOpener": True,
+            "windowNameLength": 12,
+            "messages": [{"originHost": "insight.example.com", "shape": "object(keys=resultKey,SECRETTOKEN)"}],
+        }
+    )
+    _debug_dump_hydration_signals(page, "test-label")
+    out = capsys.readouterr().out
+    assert "test-label" in out
+    assert "insight.example.com" in out
+    assert "postMessage events observed so far: 1" in out
+
+
+def test_debug_dump_hydration_signals_reports_read_failure(capsys):
+    page = EvaluatePage(evaluate_raises=True)
+    _debug_dump_hydration_signals(page, "test-label")  # must not raise
+    out = capsys.readouterr().out
+    assert "hydration signal read failed" in out
+
+
+def test_attach_popup_runtime_diagnostics_registers_all_listeners():
+    page = FakeEventPage()
+    _attach_popup_runtime_diagnostics(page)
+    assert set(page._handlers.keys()) == {"console", "pageerror", "request", "response"}
+
+
+def test_attach_popup_runtime_diagnostics_never_raises_when_on_fails():
+    page = FakeEventPage(on_raises=True)
+    _attach_popup_runtime_diagnostics(page)  # must not raise
+
+
+def test_attach_popup_runtime_diagnostics_console_and_request_never_print_secrets(capsys):
+    page = FakeEventPage()
+    _attach_popup_runtime_diagnostics(page)
+
+    class FakeConsoleMessage:
+        type = "log"
+        text = "some benign log line"
+
+    class FakeRequest:
+        method = "POST"
+        url = TEMPFILE_URL
+
+    page.fire("console", FakeConsoleMessage())
+    page.fire("request", FakeRequest())
+
+    out = capsys.readouterr().out
+    assert "SESSIONABC" not in out
+    assert "KEY123" not in out
+
+
+def test_describe_locator_returns_evaluate_result():
+    locator = MagicMock()
+    locator.evaluate.return_value = '{"tag": "BUTTON", "text": "Download"}'
+    assert _describe_locator(locator) == '{"tag": "BUTTON", "text": "Download"}'
+
+
+def test_describe_locator_never_raises_when_evaluate_fails():
+    locator = MagicMock()
+    locator.evaluate.side_effect = RuntimeError("boom")
+    result = _describe_locator(locator)
+    assert "description failed" in result
 
 
 def test_generate_export_filename_format():

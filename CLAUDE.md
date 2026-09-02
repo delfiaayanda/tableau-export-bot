@@ -1072,6 +1072,115 @@ genuinely the Full Data export (larger than the previously-captured
 Summary file, matching the HAR's Full Data filename/content
 characteristics).
 
+### The popup's DOM never hydrates in automation -- root cause still unconfirmed, high-signal diagnostics added
+
+**A user then ran the click-driven Full Data version against the real
+server.** Login, dashboard load, and the Download -> Data popup all
+worked, but the popup's own DOM stayed completely empty even after this
+project's polling wait (0 buttons, 0 "Download"-text matches, ~931 bytes
+of HTML, empty innerText -- the same shape as the very first "0 buttons"
+finding from an earlier round, but this time confirmed NOT to be a
+one-shot timing artifact, since `_switch_to_full_data_and_download()`
+polls for up to `VIEW_DATA_POPUP_TIMEOUT_MS` before giving up), and the
+run ultimately failed with "Never observed the View Data tempfile
+response." The user's explicit instruction was to stop guessing more
+locators (an empty DOM has no candidate to find, so a wrong locator
+isn't the failure mode here) and instead investigate why the popup never
+hydrates for automation the way it does for a real human click covering:
+window.open parameters, postMessage/opener/window.name, console/page
+errors, the popup's own network requests, and whether automation opens
+the popup differently than a human click does.
+
+**Diagnostics added (all TEMPORARY DEBUG ONLY, independently
+try/excepted, never touching credentials/cookies/tokens or message
+payload contents):**
+
+- `_attach_popup_runtime_diagnostics(view_data_page)` -- attaches
+  page-scoped (not the shared export/tempfile-filtered logger already in
+  place) `console`, `pageerror`, `request`, and `response` listeners
+  directly on the popup, reporting every console message, uncaught JS
+  error, and every request/response it personally fires, unfiltered --
+  answering directly whether the popup's own JS runs and does anything
+  network-wise at all.
+- `_attach_message_listener(target_page)` + `_MESSAGE_LISTENER_SCRIPT`
+  (idempotent -- safe to inject on both the main page and the popup) --
+  injects a `window.addEventListener('message', ...)` handler that
+  records only a message's sender host and a coarse shape (`typeof`, or
+  for objects, its top-level key names) into `window.__exportbotMessages`
+  -- never the actual payload, which could carry session-scoped state.
+  `_read_hydration_signals()` / `_debug_dump_hydration_signals()` read
+  and print that array back, plus `window.opener` presence and
+  `window.name`'s LENGTH only (never the raw value, in case it embeds an
+  opaque identifier) -- together answering whether a postMessage
+  handshake with the opener is the popup's actual hydration mechanism,
+  and whether the popup even has a live `window.opener` reference to use
+  for one (a real category of automation-vs-human divergence: browser
+  popup/COOP/site-isolation behavior can null out `window.opener` in
+  ways that differ between a human-driven and an automation-driven
+  popup).
+- `_describe_locator(locator)` -- prints the actual matched element's
+  tag/role/aria-label/short text right before
+  `_switch_to_full_data_and_download()` clicks it, so a real click is
+  distinguishable from an accidental false-positive match, if one ever
+  occurs.
+- Both the main dashboard page and the popup get the message listener
+  and a hydration-signal dump (before and after the two clicks), and the
+  popup additionally gets the console/pageerror/own-network listeners,
+  attached as early as this project can reach them (right after the
+  popup is captured via `expect_popup()`, before even
+  `wait_for_load_state("domcontentloaded")` for the runtime listeners).
+
+**A cross-check of both real HAR captures this project already has**
+(the original Crosstab/Summary HAR and the newer Full Data one) surfaced
+something worth recording even though it wasn't acted on: in both, every
+single VizQL "View Data" dialog command -- `launch-hybrid-view-data-dialog`,
+both `get-view-data-dialog-tab-pres-model` calls, and the export command
+itself -- is an XHR/fetch tied to the exact same long-lived VizQL session
+id already used for ordinary dashboard interactions (e.g.
+`render-tooltip-server`), and neither HAR contains a `document`-typed
+navigation entry for a second window at all -- no `hybrid-window/...`
+page load, no second `pageref`. The Full Data HAR additionally revealed
+an async job pattern this project hadn't seen before: after the export
+command, there's a `progress/sessions/{id}` polling loop (many GETs)
+before the final `tempfile` response -- unlike the Summary flow, which
+goes straight from the export command to the tempfile response. This
+doesn't change `_wait_for_tempfile_capture()` at all (it already waits
+for any matching tempfile response, regardless of what happens in
+between), but it is worth knowing the Full Data export can legitimately
+take longer server-side than Summary did.
+
+This HAR evidence is **not conclusive** -- both files also carry no
+`log.pages` array and no `pageref` on any entry at all, which is
+consistent with how they were captured/reduced (DevTools attached only
+to the main tab, or a reduction step that stripped page-context
+metadata) rather than proof that no second window exists. It was
+deliberately **not acted on** by changing where
+`_switch_to_full_data_and_download()` looks for its controls -- doing so
+without live confirmation would be exactly the kind of guess this round
+was told to avoid. It's recorded here as the next concrete thing to
+check if the diagnostics above show the popup's own JS truly never runs
+or never receives anything: the real "Full Data"/"Download" controls a
+human clicks may render as an overlay on the MAIN dashboard page rather
+than inside this "Hybrid Popup Window."
+
+Regression tests (`tests/test_browser_crosstab.py`) cover the new
+functions: `_attach_message_listener()` (never raises when `evaluate()`
+fails), `_read_hydration_signals()` (returns the evaluated result,
+`{"error": ...}` on failure, never raises), `_debug_dump_hydration_signals()`
+(prints observed message count/sender host without the payload, and the
+read-failure case), `_attach_popup_runtime_diagnostics()` (registers all
+four listeners, never raises when `.on()` fails, and a dedicated
+secrets-never-printed check firing a real console/request event through
+the registered handlers), and `_describe_locator()` (returns the
+evaluated description, `"<description failed: ...>"` on failure). Full
+suite: 143 passed. **Not yet run against the real server** -- this is,
+again, the very diagnostic meant to produce that data; once its
+[POPUPDEBUG] output (console/pageerror/own-network activity, postMessage
+count and sender hosts, opener presence, window.name length, and which
+element `_switch_to_full_data_and_download()` actually matched and
+clicked) is shared back, the actual root cause -- and a real, evidence-
+based fix -- can finally be identified instead of guessed at.
+
 ## What is tested vs. not
 
 Tested in this environment (`pytest`, no network):
@@ -1172,7 +1281,16 @@ Tested in this environment (`pytest`, no network):
   Download-text matches, iframes, shadow roots, canvases -- and other
   browser-context pages, with URLs redacted, saves a screenshot, all
   independently try/excepted so any single failure here is reported but
-  never blocks the real export), and `run_browser_crosstab_export()`'s
+  never blocks the real export), `_attach_message_listener()` /
+  `_read_hydration_signals()` / `_debug_dump_hydration_signals()`
+  (temporary popup/main-page hydration diagnostics: never raise when
+  `evaluate()` fails, and report observed postMessage count/sender host
+  without ever printing a message's payload), `_attach_popup_runtime_diagnostics()`
+  (temporary popup-scoped console/pageerror/own-request/own-response
+  diagnostics: registers all four listeners, never raises when `.on()`
+  fails, and a dedicated secrets-never-printed check), `_describe_locator()`
+  (temporary: returns a matched element's safe description, or a
+  failure string, never raises), and `run_browser_crosstab_export()`'s
   orchestration (goto order, browser launch args, browser always
   closed), all using hand-built fake Playwright-like objects -- no real
   browser, no real Tableau DOM.
@@ -1197,6 +1315,14 @@ automation" above for exactly why):
   Download click sequence, and whether the resulting CSV is genuinely the
   Full Data export (substantially larger than, and structurally
   different from, the previously-captured Summary file).
+- Whether the popup's DOM ever hydrates at all in automation, and if not,
+  why: this is exactly what the new [POPUPDEBUG] diagnostics (see "The
+  popup's DOM never hydrates in automation" above) exist to answer --
+  console/page errors, the popup's own network activity, postMessage
+  events it receives, `window.opener`/`window.name` state, and which
+  element (if any) `_switch_to_full_data_and_download()` actually
+  matches and clicks. None of this can be observed without a real
+  browser against the live server.
 
 Not tested, requires a machine with access to `insight.erajaya.com`:
 - `discover_api_version()` against the real `serverinfo` endpoint (a user

@@ -42,6 +42,48 @@ nothing the popup's JS does afterward can be missed), drives the two
 clicks above, then waits for the capture. `_save_tempfile_response()`
 (unchanged) validates and saves the captured response's body.
 
+A real-server run of `_switch_to_full_data_and_download()` then reported
+the popup's DOM as still completely empty (0 buttons, 0 download-text
+matches, ~931 bytes of HTML, empty innerText) even after this project's
+own polling wait, and the run ultimately timed out never observing the
+tempfile response -- yet a real human click on the same window (per the
+HAR above) does complete the export. This rules out "the locator
+candidates are wrong" (an empty DOM has no candidate to find at all) and
+points at a hydration/initialization gap between how a human's click
+opens/primes this window and how this project's automated click does.
+`_attach_popup_runtime_diagnostics()` (console messages, uncaught JS
+errors, and every request/response the popup page personally fires,
+unfiltered) and `_attach_message_listener()` +
+`_debug_dump_hydration_signals()` (whether the popup ever receives a
+window.postMessage from anywhere, plus window.opener/window.name) were
+added -- all TEMPORARY DEBUG ONLY, independently try/excepted, never
+touching credentials/cookies/tokens or message payload contents (only
+sender host + a coarse shape) -- to answer that question directly rather
+than guessing at another locator. `_describe_locator()` also logs which
+actual element `_switch_to_full_data_and_download()` matched and clicked,
+so a false-positive match is distinguishable from a real one.
+
+Separately, re-analyzing both real HAR captures this project has (the
+original Crosstab/Summary one and the newer Full Data one) as
+cross-checking evidence: in both, every VizQL "View Data" dialog command
+-- launch, tab-pres-model, the export command itself -- is an XHR/fetch
+tied to the SAME long-lived VizQL session id already used for ordinary
+dashboard interactions (e.g. tooltip rendering), and neither HAR contains
+a navigation request for a second document (no `hybrid-window/...`
+`document`-typed entry, no second `pageref`). This is not conclusive on
+its own -- both HARs also carry no multi-page/`pages` metadata at all, a
+generic sign of how they were captured/reduced rather than proof no
+popup exists -- but it is a real, evidence-based reason to suspect the
+interactive "Full Data"/"Download" controls a human actually clicks may
+render as an overlay on the MAIN dashboard page rather than inside this
+"Hybrid Popup Window" at all, which would also explain why the popup's
+own DOM stays empty no matter how long this project waits on it. This
+project has not acted on that theory (no locator search was added
+against the main page for these controls) since it cannot be confirmed
+without a live run; it's recorded here as the next thing to check if the
+new diagnostics above show the popup truly never does anything on its
+own.
+
 NOT exercised against the real server from this environment: no browser
 binary is installed here (Chromium download is blocked by this sandbox's
 network policy) and network access to insight.erajaya.com is blocked
@@ -53,7 +95,9 @@ page:
   - run with HEADLESS=false to watch it interactively, and
   - check <EXPORT_DIR>/debug_<step>.png, saved automatically on failure,
   - check the [NETDEBUG]-prefixed log lines for export/tempfile network
-    activity, and
+    activity,
+  - check the [POPUPDEBUG]-prefixed log lines for the new hydration
+    diagnostics (console/pageerror/own-network/postMessage/opener), and
   - then adjust the candidate locator lists in _login_if_needed() /
     _wait_for_dashboard() / _export_crosstab_csv() /
     _switch_to_full_data_and_download() below to match what you see.
@@ -237,6 +281,139 @@ def _save_debug_screenshot(page, export_dir: Path, label: str) -> None:
         page.screenshot(path=str(export_dir / f"debug_{label}.png"))
     except Exception:
         pass  # best-effort only -- never let debugging aid break the real error
+
+
+# TEMPORARY DEBUG ONLY: a real-server run showed the "View Data" popup's
+# DOM is essentially empty (0 buttons, 0 text, ~931 bytes of HTML) even
+# after this project's own polling wait -- yet a real human click on the
+# same window completes a Full Data export. This script (idempotent --
+# safe to inject more than once on the same page) records, without ever
+# exposing a message's actual payload, whether that window ever receives
+# a window.postMessage from anywhere -- a plausible hydration handshake
+# this project's automation might not be triggering the same way a real
+# user's click does.
+_MESSAGE_LISTENER_SCRIPT = """
+if (!window.__exportbotMessageListenerAttached) {
+    window.__exportbotMessageListenerAttached = true;
+    window.__exportbotMessages = [];
+    window.addEventListener('message', function (event) {
+        var shape;
+        try {
+            if (event.data === null || event.data === undefined) {
+                shape = String(event.data);
+            } else if (typeof event.data === 'string') {
+                shape = 'string(len=' + event.data.length + ')';
+            } else if (typeof event.data === 'object') {
+                shape = 'object(keys=' + Object.keys(event.data).slice(0, 10).join(',') + ')';
+            } else {
+                shape = typeof event.data;
+            }
+        } catch (e) {
+            shape = 'unreadable';
+        }
+        var originHost = 'unknown';
+        try {
+            originHost = new URL(event.origin).host;
+        } catch (e) {}
+        window.__exportbotMessages.push({ originHost: originHost, shape: shape });
+    });
+}
+"""
+
+
+def _attach_message_listener(target_page) -> None:
+    """TEMPORARY DEBUG ONLY. Injects _MESSAGE_LISTENER_SCRIPT into
+    `target_page` immediately (via evaluate()) -- works for an
+    already-loaded page (the main dashboard) and, called again right
+    after a popup's domcontentloaded, for the popup too. Never raises."""
+    try:
+        target_page.evaluate(_MESSAGE_LISTENER_SCRIPT)
+    except Exception as exc:
+        print(f"[POPUPDEBUG] could not attach message listener: {exc}")
+
+
+def _read_hydration_signals(target_page) -> dict:
+    """Reads back window.opener presence, window.name LENGTH (never the
+    raw value -- it may embed an opaque identifier), and any
+    postMessage events _attach_message_listener() observed. Never
+    raises -- returns {"error": ...} instead."""
+    script = (
+        "() => ({"
+        "hasOpener: (window.opener !== null && window.opener !== undefined), "
+        "windowNameLength: (window.name || '').length, "
+        "messages: window.__exportbotMessages || []"
+        "})"
+    )
+    try:
+        return target_page.evaluate(script)
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def _debug_dump_hydration_signals(target_page, label: str) -> None:
+    """TEMPORARY DEBUG ONLY: prints the signals above. `label`
+    distinguishes which page and which point in the flow this snapshot
+    was taken at (e.g. "popup before Full Data click")."""
+    signals = _read_hydration_signals(target_page)
+    if "error" in signals:
+        print(f"[POPUPDEBUG] ({label}) hydration signal read failed: {signals['error']}")
+        return
+    print(f"[POPUPDEBUG] ({label}) window.opener present = {signals.get('hasOpener')}")
+    print(f"[POPUPDEBUG] ({label}) window.name length = {signals.get('windowNameLength')}")
+    messages = signals.get("messages") or []
+    print(f"[POPUPDEBUG] ({label}) postMessage events observed so far: {len(messages)}")
+    for m in messages[:20]:
+        print(f"[POPUPDEBUG] ({label})   from={m.get('originHost')} shape={m.get('shape')}")
+
+
+def _attach_popup_runtime_diagnostics(view_data_page) -> None:
+    """TEMPORARY DEBUG ONLY -- investigates why the "View Data" popup's
+    DOM appears totally empty in automation despite a real human click
+    on the same window completing a Full Data export (see module
+    docstring). Reports, for this SPECIFIC page (not the shared
+    export/tempfile-filtered logger already attached elsewhere):
+    console messages and uncaught JS errors (does its JS even run
+    without erroring?), and every request/response it personally
+    fires (does it make ANY network call on its own, unfiltered?).
+    Every attachment is independently try/excepted -- a failure here
+    must never block the real export attempt. Never logs request/
+    response bodies; URLs are redacted."""
+    try:
+        view_data_page.on("console", lambda msg: print(f"[POPUPDEBUG] console[{msg.type}] {msg.text[:300]}"))
+    except Exception as exc:
+        print(f"[POPUPDEBUG] could not attach console listener: {exc}")
+    try:
+        view_data_page.on("pageerror", lambda err: print(f"[POPUPDEBUG] pageerror: {str(err)[:300]}"))
+    except Exception as exc:
+        print(f"[POPUPDEBUG] could not attach pageerror listener: {exc}")
+    try:
+        view_data_page.on(
+            "request", lambda req: print(f"[POPUPDEBUG] popup-own request {req.method} {_redact_url(req.url)}")
+        )
+    except Exception as exc:
+        print(f"[POPUPDEBUG] could not attach popup-own request listener: {exc}")
+    try:
+        view_data_page.on(
+            "response", lambda res: print(f"[POPUPDEBUG] popup-own response {res.status} {_redact_url(res.url)}")
+        )
+    except Exception as exc:
+        print(f"[POPUPDEBUG] could not attach popup-own response listener: {exc}")
+
+
+def _describe_locator(locator) -> str:
+    """TEMPORARY DEBUG ONLY -- best-effort, safe description (tag/role/
+    aria-label/short visible text -- the same class of visible-UI-only
+    info _inspect_frame() already prints) of a matched locator's
+    underlying element, used to confirm a click landed on something
+    real and meaningful rather than a false-positive match. Never
+    raises."""
+    try:
+        return locator.evaluate(
+            "el => JSON.stringify({tag: el.tagName, role: el.getAttribute('role'), "
+            "ariaLabel: el.getAttribute('aria-label'), text: (el.textContent || '').trim().slice(0, 60)})"
+        )
+    except Exception as exc:
+        return f"<description failed: {exc}>"
 
 
 def _login_if_needed(page, username: str, password: str) -> None:
@@ -516,20 +693,22 @@ def _export_crosstab_csv(page, export_dir: Path):
 
     tempfile_capture = _TempfileCapture()
     _attach_export_network_diagnostics([page], tempfile_capture)
+    _attach_message_listener(page)  # TEMPORARY DEBUG ONLY -- see module docstring
 
     # Clicking "Data" opens a separate "View Data" popup window/tab (a new
     # Playwright Page in the same browser context, titled
     # "Hybrid Popup Window") -- not an in-page dialog. This click is kept
-    # (confirmed working against the real server). A real-server run
-    # showed this popup's own JS then fires the entire HAR export
-    # sequence AUTOMATICALLY on its own -- no further click, no command
-    # issued by this project -- so nothing more is triggered here; see
-    # _wait_for_tempfile_capture() below.
+    # (confirmed working against the real server). A HAR capture of the
+    # real manual Full Data flow showed reaching the actual export
+    # requires two further real clicks inside this popup -- see
+    # _switch_to_full_data_and_download() below.
     try:
         with page.expect_popup(timeout=VIEW_DATA_POPUP_TIMEOUT_MS) as popup_info:
             data_item.click()
         view_data_page = popup_info.value
+        _attach_popup_runtime_diagnostics(view_data_page)  # TEMPORARY DEBUG ONLY
         view_data_page.wait_for_load_state("domcontentloaded", timeout=VIEW_DATA_POPUP_TIMEOUT_MS)
+        _attach_message_listener(view_data_page)  # TEMPORARY DEBUG ONLY
     except Exception as exc:
         _save_debug_screenshot(page, export_dir, "view-data-popup-not-opened")
         raise BrowserAutomationError(f"The 'View Data' popup window did not open: {exc}") from exc
@@ -541,8 +720,12 @@ def _export_crosstab_csv(page, export_dir: Path):
     # empty (see CLAUDE.md); still useful context if a future Tableau
     # update changes that. Never touches credentials/cookies/tokens.
     _debug_dump_view_data_popup(view_data_page, export_dir)
+    _debug_dump_hydration_signals(view_data_page, "popup before Full Data/Download clicks")
 
     _switch_to_full_data_and_download(view_data_page, export_dir)
+
+    _debug_dump_hydration_signals(view_data_page, "popup after Full Data/Download clicks")
+    _debug_dump_hydration_signals(page, "main dashboard page after Full Data/Download clicks")
 
     _wait_for_tempfile_capture(view_data_page, tempfile_capture, NETWORK_EXPORT_TIMEOUT_MS)
     return _save_tempfile_response(tempfile_capture.response, export_dir)
@@ -577,6 +760,7 @@ def _switch_to_full_data_and_download(view_data_page, export_dir: Path) -> None:
         )
 
     print("Switching to Full Data...")
+    print(f"[POPUPDEBUG] Full Data candidate matched: {_describe_locator(full_data_tab)}")  # TEMPORARY DEBUG ONLY
     full_data_tab.click()
 
     download_button = _find_first_with_wait(
@@ -589,6 +773,7 @@ def _switch_to_full_data_and_download(view_data_page, export_dir: Path) -> None:
         )
 
     print("Exporting Full Data...")
+    print(f"[POPUPDEBUG] Download candidate matched: {_describe_locator(download_button)}")  # TEMPORARY DEBUG ONLY
     download_button.click()
 
 
