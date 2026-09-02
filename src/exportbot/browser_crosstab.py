@@ -206,14 +206,33 @@ DOWNLOAD_BUTTON_CANDIDATES = [
 # popup's own UI toolkit) and keep the role-based/CSS candidates as a
 # low-cost fallback in case a future Tableau version adds real ARIA
 # semantics.
+# Confirmed from a real-server DOM dump taken right after the Full Data
+# click: the tab is <button aria-label="Full Data Table"
+# data-tb-test-id="-SideTab">Full Data</button>. The test id is shared
+# with the "Summary" tab so it can't be used alone; the aria-label is
+# unambiguous, so it goes first, with the (also confirmed working) text
+# match kept behind it.
 FULL_DATA_TAB_CANDIDATES = [
+    lambda s: s.locator('button[aria-label="Full Data Table"]'),
     lambda s: s.get_by_text(re.compile(r"^full data$", re.I)),
     lambda s: s.get_by_role("tab", name=re.compile(r"^full data$", re.I)),
     lambda s: s.get_by_role("button", name=re.compile(r"^full data$", re.I)),
     lambda s: s.get_by_role("menuitem", name=re.compile(r"^full data$", re.I)),
 ]
 
+# Also confirmed from that same dump: the real control is
+# <button data-tb-test-id="download-data-Button" title="..."> wrapping a
+# <span aria-label="Download in CSV format">Download</span>. Targeting
+# the BUTTON (not the inner span the text match resolves to) is what
+# makes its `title` readable -- see _wait_for_full_data_to_load().
+DOWNLOAD_DATA_BUTTON_SELECTOR = '[data-tb-test-id="download-data-Button"]'
+
+# The button's own title while the Full Data grid is still loading, taken
+# verbatim from that dump ("0 rows  0 fields" was showing at the time).
+DOWNLOAD_BUTTON_NOT_READY_RE = re.compile(r"no column data available", re.I)
+
 VIEW_DATA_DOWNLOAD_BUTTON_CANDIDATES = [
+    lambda s: s.locator(DOWNLOAD_DATA_BUTTON_SELECTOR),
     lambda s: s.get_by_text(re.compile(r"^download$", re.I)),
     # Broader than the exact-text match above: a real-server run found
     # this popup's controls carry no ARIA role/label at all (see comment
@@ -548,52 +567,40 @@ def _log_export_response(response) -> None:
         pass
 
 
-class _CapturedTempfile:
-    """An immutable snapshot of the tempfile response's status/headers/
-    body, taken eagerly at capture time -- matches the small subset of
-    Playwright's Response/APIResponse interface _save_tempfile_response()
-    actually uses, so that function needs no changes. Snapshotting
-    eagerly (rather than holding the live Response object) avoids
-    depending on it staying readable after the page/context that
-    produced it moves on."""
-
-    def __init__(self, url: str, status: int, headers: dict, body: bytes):
-        self.url = url
-        self.status = status
-        self.headers = headers
-        self._body = body
-
-    def body(self) -> bytes:
-        return self._body
-
-
 class _TempfileCapture:
-    """Holds the tempfile response once observed, populated by
+    """Holds the tempfile Response once observed, populated by
     _capture_tempfile_response()."""
 
     def __init__(self):
-        self.response: _CapturedTempfile | None = None
+        self.response = None
 
 
 def _capture_tempfile_response(response, capture: _TempfileCapture) -> None:
-    """Passively snapshots the first observed `.../tempfile/...`
-    response. A real-server run showed Tableau's own "View Data" popup
-    JS fires the entire export-view-data-summary-to-csv-server ->
-    tempfile sequence automatically, with no click and no command issued
-    by this project at all -- this captures that real response directly
-    instead of reconstructing/reissuing anything ourselves. Never logs
-    the body. Never raises."""
+    """Passively records the first observed `.../tempfile/...` response
+    object -- the one carrying the exported CSV.
+
+    Deliberately reads NOTHING from the response here except its cached
+    `url`. Playwright's sync API does not allow a call that round-trips
+    to the browser -- `Response.body()` above all -- from inside an
+    event handler; it raises. An earlier version built an eager
+    status/headers/body snapshot right here inside a bare
+    `except Exception: pass`, so on a real server run a genuinely
+    successful `200 text/csv` tempfile response -- one this handler's
+    own sibling logger had just printed to the console -- was silently
+    dropped, and the run then failed with "Never observed the View Data
+    tempfile response" while the evidence of it sat in the log directly
+    above. The body is read afterwards, on the main flow, by
+    _save_tempfile_response().
+
+    Never raises -- but never fails silently either: a capture failure
+    is exactly the bug described above, so it is always reported."""
     try:
         if capture.response is not None or not _is_tempfile_url(response.url):
             return
-        capture.response = _CapturedTempfile(
-            url=response.url,
-            status=response.status,
-            headers=dict(response.headers or {}),
-            body=response.body(),
-        )
-    except Exception:
-        pass
+        capture.response = response
+        print("[NETDEBUG] captured the tempfile response (body is read after the wait)")
+    except Exception as exc:
+        print(f"[NETDEBUG] failed to capture a tempfile response: {exc}")
 
 
 def _attach_export_network_diagnostics(pages, tempfile_capture: _TempfileCapture | None = None) -> None:
@@ -619,6 +626,39 @@ def _attach_export_network_diagnostics(pages, tempfile_capture: _TempfileCapture
                 page.on("response", lambda response: _capture_tempfile_response(response, tempfile_capture))
         except Exception as exc:
             print(f"[NETDEBUG] could not attach network listeners to a page: {exc}")
+
+
+def _wait_for_download_button_ready(view_data_page, download_button, timeout_ms) -> None:
+    """Waits for the Full Data grid to actually have rows before the
+    export is triggered.
+
+    Switching to "Full Data" makes the popup fetch the underlying rows
+    asynchronously: a real-server DOM dump taken immediately after that
+    click showed "0 rows  0 fields" and a Download button still carrying
+    `title="No column data available to download"`. Clicking Download in
+    that state risks exporting an empty file, so this polls that same
+    button's live `title` (no fixed sleep, bounded by the caller's
+    timeout) until it clears.
+
+    Best-effort by design -- if the title can't be read at all (the
+    matched element is the inner label span rather than the button, say)
+    or never clears (a view that genuinely has no rows, or a future
+    Tableau version wording it differently), this returns and lets the
+    export proceed rather than failing the whole run on a heuristic."""
+    deadline = time.monotonic() + timeout_ms / 1000
+    while time.monotonic() < deadline:
+        try:
+            title = download_button.get_attribute("title") or ""
+        except Exception as exc:
+            print(f"[POPUPDEBUG] could not read the Download button's title ({exc}); continuing.")
+            return
+        if not DOWNLOAD_BUTTON_NOT_READY_RE.search(title):
+            return
+        view_data_page.wait_for_timeout(POLL_INTERVAL_MS)
+    print(
+        "[POPUPDEBUG] Full Data rows never finished loading (Download button still "
+        "reports no column data available); attempting the export anyway."
+    )
 
 
 def _wait_for_tempfile_capture(driver_page, capture: _TempfileCapture, timeout_ms) -> None:
@@ -686,7 +726,15 @@ def _save_tempfile_response(response, export_dir: Path) -> Path:
             f"Tempfile response had an unexpected Content-Type ({content_type!r}); refusing to save it."
         )
 
-    body = response.body()
+    # Read the body HERE, on the main flow -- never inside the network
+    # event handler that captured this response (see
+    # _capture_tempfile_response for why that silently failed before).
+    try:
+        body = response.body()
+    except Exception as exc:
+        raise BrowserAutomationError(
+            f"Captured the tempfile response but could not read its body: {exc}"
+        ) from exc
 
     content_disposition = None
     try:
@@ -761,7 +809,12 @@ def _export_crosstab_csv(page, export_dir: Path):
     _debug_dump_hydration_signals(page, "main dashboard page after Full Data/Download clicks")
 
     _wait_for_tempfile_capture(view_data_page, tempfile_capture, NETWORK_EXPORT_TIMEOUT_MS)
-    return _save_tempfile_response(tempfile_capture.response, export_dir)
+    saved_path = _save_tempfile_response(tempfile_capture.response, export_dir)
+    try:
+        print(f"Saved {saved_path} ({saved_path.stat().st_size} bytes)")
+    except Exception:
+        pass  # reporting the size must never break a successful export
+    return saved_path
 
 
 def _switch_to_full_data_and_download(view_data_page, export_dir: Path) -> None:
@@ -811,6 +864,9 @@ def _switch_to_full_data_and_download(view_data_page, export_dir: Path) -> None:
         raise BrowserAutomationError(
             'Could not find the "Download" button in the View Data window after switching to Full Data.'
         )
+
+    print("Waiting for Full Data rows to load...")
+    _wait_for_download_button_ready(view_data_page, download_button, VIEW_DATA_POPUP_TIMEOUT_MS)
 
     print("Exporting Full Data...")
     print(f"[POPUPDEBUG] Download candidate matched: {_describe_locator(download_button)}")  # TEMPORARY DEBUG ONLY

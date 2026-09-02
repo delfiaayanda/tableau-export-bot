@@ -1249,6 +1249,77 @@ server** -- the next run is what will show whether the widened Download
 candidates actually match, and if not, the reused DOM dump's output is
 the next concrete evidence to act on.
 
+### The real bug: `Response.body()` inside a Playwright sync event handler
+
+**The next real-server run drove the whole flow correctly for the first
+time** -- login, dashboard, popup, Full Data click, Download click --
+and the export genuinely succeeded on Tableau's side:
+
+```
+[POPUPDEBUG] Full Data candidate matched: {"tag":"SPAN","role":null,"ariaLabel":null,"text":"Full Data"}
+[DEBUG] popup.title() = View Data: Persentase Nasional      <-- popup fully hydrated
+[POPUPDEBUG] Download candidate matched: {"tag":"SPAN","ariaLabel":"Download in CSV format","text":"Download"}
+[NETDEBUG] request  method=POST url=.../commands/tabsrv/export-view-data-underlying-to-csv-server
+[NETDEBUG] response status=200 ... export-view-data-underlying-to-csv-server
+[NETDEBUG] request  method=GET url=.../tempfile/sessions/REDACTED?key=REDACTED&keepfile=yes&attachment=yes
+[NETDEBUG] response status=200 content_type='text/csv' ... <-- tempfile response
+FAILURE: Never observed the View Data tempfile response
+```
+
+The run failed claiming it never saw the tempfile response **on the line
+directly below the log proving it had**. Root cause, found by reading
+`_capture_tempfile_response()`: it built an eager status/headers/body
+snapshot (`_CapturedTempfile`) *inside the network event handler*, and
+`Response.body()` requires a round-trip to the browser -- which
+Playwright's **sync** API does not permit from inside an event handler.
+It raised every time, and the handler's bare `except Exception: pass`
+swallowed it, so the capture silently stayed empty while its sibling
+logger (which only touches cached attributes) printed the response
+happily. Two bugs in one: the illegal call, and the silent except that
+hid it for three rounds.
+
+**Fix:**
+- `_capture_tempfile_response()` now reads nothing but the response's
+  cached `url` and stores the live `Response` object itself. The body is
+  read afterwards, on the main flow, by `_save_tempfile_response()` --
+  which works unchanged, since a Playwright `Response` exposes the same
+  `status`/`headers`/`body()` surface the old snapshot class did.
+  `_CapturedTempfile` was deleted as dead code.
+- That handler no longer fails silently: it prints on capture, and
+  prints the exception if capture ever fails.
+- `_save_tempfile_response()` wraps its `body()` read so a genuine read
+  failure surfaces as a clear `BrowserAutomationError` rather than a raw
+  traceback.
+- `_export_crosstab_csv()` prints the saved path and byte size.
+
+**Also fixed, from the same run's DOM dump** (the first one ever taken
+*after* the Full Data click, which showed the popup fully rendered:
+`body_inner_html_length` 10297, title "View Data: Persentase Nasional",
+7 real buttons): the dump caught the grid mid-load -- `"0 rows  0
+fields"` with the Download button carrying
+`title="No column data available to download"` -- meaning Download was
+being clicked before the underlying rows had arrived, risking an empty
+export. `_wait_for_download_button_ready()` now polls that same button's
+live `title` until the "no column data available" wording clears, then
+clicks. Deliberately best-effort: if the title can't be read, or never
+clears (a view that genuinely has no rows), it proceeds anyway rather
+than failing the run on a heuristic.
+
+The dump also gave the real markup for both controls, so both candidate
+lists now lead with confirmed selectors --
+`button[aria-label="Full Data Table"]` and
+`[data-tb-test-id="download-data-Button"]` -- ahead of the text matches
+that were working. Targeting the button rather than the inner label span
+is also what makes the readiness `title` readable.
+
+Regression tests: `_capture_tempfile_response()` now has a test pinning
+the exact bug shape -- a response whose `status`/`headers`/`body()` all
+raise (what the sync-API restriction looks like from inside a handler)
+must **still** be captured -- plus the unreadable-URL case;
+`_save_tempfile_response()` has a body-read-failure test; and
+`_wait_for_download_button_ready()` is covered for the polls-until-ready,
+unreadable-title, and never-clears paths. Full suite: 148 passed.
+
 ## What is tested vs. not
 
 Tested in this environment (`pytest`, no network):

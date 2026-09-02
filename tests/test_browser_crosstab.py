@@ -35,6 +35,7 @@ from src.exportbot.browser_crosstab import (
     _save_tempfile_response,
     _switch_to_full_data_and_download,
     _wait_for_dashboard,
+    _wait_for_download_button_ready,
     _wait_for_tempfile_capture,
     generate_export_filename,
     resolve_executable_path,
@@ -732,18 +733,53 @@ def test_capture_tempfile_response_keeps_first_match_only():
     assert capture.response.body() == b"first"
 
 
-def test_capture_tempfile_response_never_raises_on_broken_response():
+def test_capture_tempfile_response_never_raises_on_unreadable_url():
+    """A response whose very URL can't be read can't be matched, so it
+    isn't captured -- and the handler still must not raise."""
     capture = _TempfileCapture()
 
     class BrokenResponse:
-        url = TEMPFILE_URL
-
         @property
-        def status(self):
+        def url(self):
             raise RuntimeError("boom")
 
     _capture_tempfile_response(BrokenResponse(), capture)  # must not raise
     assert capture.response is None
+
+
+def test_capture_tempfile_response_does_not_read_body_inside_the_handler():
+    """Regression test for the real bug that made a live run fail with
+    "Never observed the View Data tempfile response" even though the
+    sibling logger had just printed a successful 200 text/csv tempfile
+    response: the handler used to build an eager status/headers/body
+    snapshot, but Playwright's sync API forbids a browser round-trip
+    (Response.body()) from inside an event handler, and the resulting
+    exception was swallowed by a bare `except: pass`.
+
+    So a response whose body()/status/headers all raise -- exactly what
+    that restriction looks like from inside the handler -- must STILL be
+    captured. The body is read later, on the main flow, where a real
+    failure surfaces as a clear error instead of a silent drop."""
+    capture = _TempfileCapture()
+
+    class HandlerHostileResponse:
+        url = TEMPFILE_URL
+
+        @property
+        def status(self):
+            raise RuntimeError("sync API called from event handler")
+
+        @property
+        def headers(self):
+            raise RuntimeError("sync API called from event handler")
+
+        def body(self):
+            raise RuntimeError("sync API called from event handler")
+
+    response = HandlerHostileResponse()
+    _capture_tempfile_response(response, capture)
+
+    assert capture.response is response
 
 
 def test_wait_for_tempfile_capture_returns_immediately_when_already_captured():
@@ -1075,6 +1111,73 @@ def test_save_tempfile_response_rejects_error_status(tmp_path):
     )
     with pytest.raises(BrowserAutomationError, match="HTTP 404"):
         _save_tempfile_response(response, tmp_path)
+
+
+def test_save_tempfile_response_reports_a_clear_error_when_body_read_fails(tmp_path):
+    """The body is read on the main flow now, not in the event handler --
+    so if that read genuinely fails, it must surface as a clear error
+    rather than a raw Playwright traceback (or, as before, a silent
+    drop)."""
+
+    class UnreadableBodyResponse(FakeAPIResponse):
+        def body(self):
+            raise RuntimeError("Protocol error: no resource with given identifier")
+
+    response = UnreadableBodyResponse(url=TEMPFILE_URL)
+    with pytest.raises(BrowserAutomationError, match="could not read its body"):
+        _save_tempfile_response(response, tmp_path)
+
+
+class ReadinessLocator:
+    """A Download-button stand-in whose `title` reports the real
+    "still loading" wording for a few polls, then clears -- mirroring
+    what a live DOM dump showed while the Full Data grid was still
+    fetching rows ("0 rows  0 fields")."""
+
+    def __init__(self, ready_after_reads=2, title_raises=False):
+        self.reads = 0
+        self._ready_after = ready_after_reads
+        self._title_raises = title_raises
+        self.click = MagicMock()
+
+    def get_attribute(self, name):
+        if self._title_raises:
+            raise RuntimeError("no such attribute")
+        self.reads += 1
+        if self.reads <= self._ready_after:
+            return "No column data available to download"
+        return "Download"
+
+
+def test_wait_for_download_button_ready_waits_until_rows_load():
+    page = ScriptedPage(script=[])
+    button = ReadinessLocator(ready_after_reads=2)
+
+    _wait_for_download_button_ready(page, button, 5_000)
+
+    assert button.reads == 3  # polled until the "no column data" title cleared
+    assert page.wait_for_timeout.call_count == 2
+
+
+def test_wait_for_download_button_ready_returns_immediately_when_title_unreadable():
+    """Best-effort by design: if the matched element is the inner label
+    span (no title of its own), don't block the export on a heuristic."""
+    page = ScriptedPage(script=[])
+    button = ReadinessLocator(title_raises=True)
+
+    _wait_for_download_button_ready(page, button, 5_000)
+
+    page.wait_for_timeout.assert_not_called()
+
+
+def test_wait_for_download_button_ready_gives_up_and_proceeds_on_timeout(capsys):
+    """A view that genuinely has no rows must not fail the whole run."""
+    page = ScriptedPage(script=[])
+    button = ReadinessLocator(ready_after_reads=10_000)  # never clears
+
+    _wait_for_download_button_ready(page, button, 10)  # must not raise
+
+    assert "attempting the export anyway" in capsys.readouterr().out
 
 
 def test_run_browser_crosstab_export_orchestrates_and_closes_browser(tmp_path):
