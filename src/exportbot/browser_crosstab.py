@@ -1,10 +1,11 @@
 """Browser-automated Tableau Crosstab CSV export via Playwright.
 
 Reproduces the exact manual workflow already confirmed to work in the
-live Tableau UI: Download -> Data -> (Crosstab view) -> CSV download.
-This exists because the REST/VizQL investigation (see CLAUDE.md) could
-not establish a session without a real browser -- the VizQL session id
-and per-visual context are minted client-side during interactive page
+live Tableau UI: Download -> Data -> (a separate "View Data" popup
+window opens) -> Download (within that popup) -> CSV download. This
+exists because the REST/VizQL investigation (see CLAUDE.md) could not
+establish a session without a real browser -- the VizQL session id and
+per-visual context are minted client-side during interactive page
 rendering. Browser automation sidesteps that entirely by driving an
 actual browser through Tableau's native login and viz UI, exactly as a
 person would.
@@ -13,14 +14,15 @@ NOT exercised against the real server from this environment: no browser
 binary is installed here (Chromium download is blocked by this sandbox's
 network policy) and network access to insight.erajaya.com is blocked
 too. The DOM selectors below are best-effort, built from accessible
-roles/names per Tableau's general UI conventions -- no DOM inspection of
-this specific dashboard was possible. If a selector doesn't match the
-live page:
+roles/names per Tableau's general UI conventions, refined against real
+local runs and one real screenshot of the "View Data" popup -- but full
+DOM inspection of this specific dashboard was never possible from here.
+If a selector doesn't match the live page:
   - run with HEADLESS=false to watch it interactively, and
   - check <EXPORT_DIR>/debug_<step>.png, saved automatically on failure,
   - then adjust the candidate locator lists in _login_if_needed() /
-    _wait_for_dashboard() / _export_crosstab_csv() below to match what
-    you see.
+    _wait_for_dashboard() / _export_crosstab_csv() /
+    _export_from_view_data_popup() below to match what you see.
 """
 
 from __future__ import annotations
@@ -41,8 +43,22 @@ LOGIN_SUBMIT_TIMEOUT_MS = 20_000
 DASHBOARD_LOAD_TIMEOUT_MS = 60_000
 DOWNLOAD_TIMEOUT_MS = 30_000
 POLL_INTERVAL_MS = 500
+VIEW_DATA_POPUP_TIMEOUT_MS = 30_000
 
 DOWNLOAD_BUTTON_CANDIDATES = [
+    lambda s: s.get_by_role("button", name=re.compile(r"^download$", re.I)),
+    lambda s: s.locator('[data-tb-test-id="download-Button"]'),
+    lambda s: s.locator('button[aria-label="Download" i]'),
+]
+
+# The "View Data" popup window's own toolbar Download button -- a
+# separate DOM/page from the main dashboard's, confirmed via a real run:
+# clicking Download -> Data opens a distinct browser window/tab titled
+# "View Data: <sheet name>" (URL under /vizql/.../hybrid-window/...) with
+# its own "Summary"/"Full Data" tabs and this Download button. Not
+# verified against the live DOM beyond the screenshot -- best-effort,
+# accessible-role-first like every other selector in this module.
+VIEW_DATA_DOWNLOAD_BUTTON_CANDIDATES = [
     lambda s: s.get_by_role("button", name=re.compile(r"^download$", re.I)),
     lambda s: s.locator('[data-tb-test-id="download-Button"]'),
     lambda s: s.locator('button[aria-label="Download" i]'),
@@ -233,47 +249,51 @@ def _export_crosstab_csv(page, export_dir: Path):
     if data_item is None:
         _save_debug_screenshot(page, export_dir, "data-menuitem-not-found")
         raise BrowserAutomationError("Could not find the 'Data' item in the Download menu.")
-    data_item.click()
+
+    # Clicking "Data" opens a separate "View Data" popup window/tab (a new
+    # Playwright Page in the same browser context, titled
+    # "View Data: <sheet name>") -- not an in-page dialog. The actual CSV
+    # export happens entirely within that popup, never on this page.
+    try:
+        with page.expect_popup(timeout=VIEW_DATA_POPUP_TIMEOUT_MS) as popup_info:
+            data_item.click()
+        view_data_page = popup_info.value
+        view_data_page.wait_for_load_state("domcontentloaded", timeout=VIEW_DATA_POPUP_TIMEOUT_MS)
+    except Exception as exc:
+        _save_debug_screenshot(page, export_dir, "view-data-popup-not-opened")
+        raise BrowserAutomationError(f"The 'View Data' popup window did not open: {exc}") from exc
 
     print("Exporting Crosstab...")
-    # The "View Data" dialog may default to a crosstab-style summary tab;
-    # click it explicitly if present, but don't fail if it's already selected.
-    crosstab_tab = _find_first(
-        scopes(),
-        [
-            lambda s: s.get_by_role("tab", name=re.compile("crosstab", re.I)),
-            lambda s: s.get_by_role("button", name=re.compile("crosstab", re.I)),
-            lambda s: s.get_by_text(re.compile("crosstab", re.I)),
-        ],
-    )
-    if crosstab_tab is not None:
-        crosstab_tab.click()
+    return _export_from_view_data_popup(view_data_page, export_dir)
 
-    export_button = _find_first(
-        scopes(),
-        [
-            lambda s: s.get_by_role("button", name=re.compile(r"download.*(csv|all rows|crosstab)", re.I)),
-            lambda s: s.get_by_role("button", name=re.compile(r"^export$", re.I)),
-            lambda s: s.get_by_role("button", name=re.compile(r"^download$", re.I)),
-        ],
+
+def _export_from_view_data_popup(view_data_page, export_dir: Path) -> Path:
+    """Performs the CSV export from within the "View Data" popup window
+    opened by Download -> Data. This popup has its own toolbar Download
+    button, entirely separate from the main dashboard's -- the download
+    itself must be caught on this page, never on the original dashboard
+    page. The main dashboard may show a "The View Data window is still
+    open. Close the View Data window?" prompt after this -- that's a
+    secondary cleanup dialog, not part of the export, and is intentionally
+    left alone."""
+    download_button = _find_first_with_wait(
+        view_data_page, VIEW_DATA_DOWNLOAD_BUTTON_CANDIDATES, DASHBOARD_LOAD_TIMEOUT_MS
     )
-    if export_button is None:
-        _save_debug_screenshot(page, export_dir, "export-button-not-found")
-        raise BrowserAutomationError("Could not find the CSV export/download button in the Data dialog.")
+    if download_button is None:
+        _save_debug_screenshot(view_data_page, export_dir, "view-data-download-button-not-found")
+        raise BrowserAutomationError('Could not find the "Download" button in the View Data window.')
 
     try:
-        # A Tableau glass-pane/dialog overlay can intercept pointer events
-        # here even though the button itself is visible/enabled/stable --
-        # wait for it to clear before attempting the click, rather than
-        # letting Playwright retry-and-timeout against a blocked click.
-        _wait_for_overlays_to_clear(page)
-        export_button.wait_for(state="visible", timeout=OVERLAY_CLEAR_TIMEOUT_MS)
-        with page.expect_download(timeout=DOWNLOAD_TIMEOUT_MS) as download_info:
-            export_button.click()
+        # Same glass-pane/dialog overlay risk as the main dashboard --
+        # wait for it to clear before attempting the click.
+        _wait_for_overlays_to_clear(view_data_page)
+        download_button.wait_for(state="visible", timeout=OVERLAY_CLEAR_TIMEOUT_MS)
+        with view_data_page.expect_download(timeout=DOWNLOAD_TIMEOUT_MS) as download_info:
+            download_button.click()
         download = download_info.value
     except Exception as exc:
-        _save_debug_screenshot(page, export_dir, "export-button-click-failed")
-        raise BrowserAutomationError(f"Could not click the CSV export/download button: {exc}") from exc
+        _save_debug_screenshot(view_data_page, export_dir, "view-data-download-click-failed")
+        raise BrowserAutomationError(f"Could not export CSV from the View Data window: {exc}") from exc
 
     export_dir.mkdir(parents=True, exist_ok=True)
     target_path = export_dir / generate_export_filename()

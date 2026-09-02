@@ -416,14 +416,40 @@ resolves immediately if a selector matches nothing — so an overlay that
 never appears is not an error) immediately before the final click,
 wrapped so any failure at this step (overlay never clears, click still
 fails) produces a clear `BrowserAutomationError` and a debug screenshot
-instead of a raw, uncaught Playwright traceback. Two regression tests
-cover this: `test_export_crosstab_csv_waits_for_overlays_before_final_click`
-(overlays clear normally) and
-`test_export_crosstab_csv_raises_and_screenshots_when_overlay_never_clears`
-(a stuck overlay is reported cleanly, not left to crash the process).
-**Still not run against the real server from here** — this fixes a
-concretely diagnosed bug from a real local run; whether the fix actually
-lets the CSV download complete has not been confirmed yet.
+instead of a raw, uncaught Playwright traceback.
+
+**A user then shared a screenshot revealing the real "final export"
+shape was wrong.** Clicking Download -> Data does not open an in-page
+dialog with a "Crosstab" tab (the assumption the overlay fix above was
+still built on) — it opens a **separate browser window/tab**, titled
+"View Data: `<sheet name>`", at a URL under
+`/vizql/v_.../hybrid-window/min/index.html?id=...` (matching the
+`launch-hybrid-view-data-dialog` VizQL command identified earlier from
+the HAR). That window has its own "Summary"/"Full Data" tabs (not
+"Crosstab" — "Summary" is active by default) and its own toolbar
+"Download" button; the actual CSV export happens entirely inside it,
+confirmed via the HAR's `export-view-data-summary-to-csv-server` +
+tempfile-GET sequence. The main dashboard can separately show "The View
+Data window is still open. Close the View Data window?" — a cleanup
+prompt, not part of the export, intentionally left alone.
+
+`_export_crosstab_csv()` was split: it now only handles Download -> Data
+and catches the new popup via `page.expect_popup()` (an event-based
+Playwright wait, not a sleep) — never `page.expect_download()` against
+the main dashboard page. A new `_export_from_view_data_popup()` does the
+actual export *inside* that popup page: finds its Download button
+(`VIEW_DATA_DOWNLOAD_BUTTON_CANDIDATES`, best-effort/unverified beyond
+the screenshot), reuses `_wait_for_overlays_to_clear()` against the
+popup (the same overlay classes could plausibly appear there too), and
+wraps `expect_download()` around the popup's own button. The old
+"Crosstab tab" click was removed entirely — it doesn't correspond to
+anything in the real UI. Regression tests cover: the full flow through
+both functions via a fake popup page, the popup failing to open, the
+popup's Download button being blocked by an overlay (clearing normally
+and never clearing), and the popup's Download button being missing.
+**Still not run against the real server from here** — this targets the
+exact popup shape from the screenshot, but whether the click actually
+completes the download has not been confirmed yet.
 
 ## What is tested vs. not
 
@@ -487,16 +513,18 @@ Tested in this environment (`pytest`, no network):
 - `browser_crosstab.py` (module) — `_find_first()`'s fallback matching,
   `_login_if_needed()` (skip/fill/submit/error paths, confirms
   credentials never printed, and the slow-rendering-form regression case),
-  `_wait_for_dashboard()` (success + timeout), and `_export_crosstab_csv()`
-  (full click sequence through to `download.save_as()` with the correct
-  timestamped filename, the optional crosstab-tab click, the
-  debug-screenshot-on-failure path, and the overlay-wait-before-final-click
-  regression cases -- overlays clearing normally, and a stuck overlay
-  producing a clean `BrowserAutomationError` instead of a raw Playwright
-  traceback), and `run_browser_crosstab_export()`'s orchestration (goto
-  order, browser launch args, browser always closed), all using
-  hand-built fake Playwright-like objects -- no real browser, no real
-  Tableau DOM.
+  `_wait_for_dashboard()` (success + timeout), `_export_crosstab_csv()`
+  (Download -> Data click sequence, catching the "View Data" popup via a
+  fake `expect_popup()`, the popup-never-opens error path, and
+  debug-screenshot-on-failure), `_export_from_view_data_popup()` (the
+  popup's own Download button click through to `download.save_as()` with
+  the correct timestamped filename, plus the overlay-wait-before-click
+  regression cases -- overlays clearing normally, a stuck overlay, and a
+  missing button -- each producing a clean `BrowserAutomationError`
+  instead of a raw Playwright traceback), and
+  `run_browser_crosstab_export()`'s orchestration (goto order, browser
+  launch args, browser always closed), all using hand-built fake
+  Playwright-like objects -- no real browser, no real Tableau DOM.
 - `browser_crosstab.py` (CLI) — config-error/success/failure reporting,
   mocking the export function entirely; confirms credentials never
   appear in output.
