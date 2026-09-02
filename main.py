@@ -1,50 +1,26 @@
 #!/usr/bin/env python3
-"""CLI entry point: python main.py"""
+"""CLI entry point: python main.py
+
+Delegates entirely to the browser-automated export
+(src/exportbot/browser_crosstab.py) -- the only extraction method
+confirmed working against the real server (see CLAUDE.md, "Success --
+end-to-end export confirmed"). The REST-based pipeline (auth.py /
+tableau_client.py / pipeline.py) is still blocked (HTTP 406 / timeout on
+the real server) and intentionally not used here; it's kept as a
+starting point for a future lighter-weight extraction method, not wired
+into this entry point.
+
+Usage: python main.py
+Environment: see browser_crosstab.py's docstring / README.md.
+"""
 
 from __future__ import annotations
 
-import sys
-
-from src.exportbot.auth import TableauServerAuthenticator
-from src.exportbot.config import ConfigError, load_config
-from src.exportbot.exceptions import ExportBotError
-from src.exportbot.logging_setup import setup_logging
-from src.exportbot.pipeline import run_pipeline
-from src.exportbot.serverinfo import discover_api_version
-from src.exportbot.tableau_client import TableauServerClient
+from browser_crosstab import main as run_browser_crosstab_main
 
 
 def main() -> int:
-    try:
-        config = load_config()
-    except ConfigError as exc:
-        print(f"Configuration error: {exc}", file=sys.stderr)
-        return 2
-
-    logger = setup_logging(config.log_level)
-
-    try:
-        if config.tableau_api_version:
-            api_version = config.tableau_api_version
-            logger.info("Using configured Tableau API version: %s", api_version)
-        else:
-            api_version = discover_api_version(config.tableau_server_url)
-            logger.info("Discovered Tableau API version via serverinfo: %s", api_version)
-
-        run_pipeline(
-            config=config,
-            authenticator=TableauServerAuthenticator(api_version=api_version),
-            client_factory=lambda session: TableauServerClient(session),
-            logger=logger,
-        )
-    except ConfigError as exc:
-        print(f"Configuration error: {exc}", file=sys.stderr)
-        return 2
-    except ExportBotError as exc:
-        logger.error("Export failed: %s", exc)
-        return 1
-
-    return 0
+    return run_browser_crosstab_main()
 
 
 if __name__ == "__main__":
