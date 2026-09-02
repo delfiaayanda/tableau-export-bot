@@ -472,6 +472,69 @@ the very diagnostic meant to produce that data; once its output is
 shared back, `VIEW_DATA_DOWNLOAD_BUTTON_CANDIDATES` should be corrected
 to match and `_debug_dump_view_data_popup()` (and its call site) removed.
 
+**A user then ran that diagnostic against the real server and got a
+striking result: zero visible buttons, zero "Download"-text elements,
+and `popup.title() == "Hybrid Popup Window"`** -- not the expected
+"View Data: <sheet name>" title assumed since the earlier screenshot.
+The popup opens correctly (`Opening Data...` / `Exporting Crosstab...`
+print as expected), but its top-level document has no matching content
+at all. This rules out "the locator candidates are just slightly wrong"
+and points at the real content living somewhere the top-level-document
+scan can't see: a nested iframe, an open shadow root, a canvas-rendered
+UI, or even a separate page in the same browser context.
+
+`_debug_dump_view_data_popup()` was extended (still temporary,
+debug-only instrumentation, still never touching credentials/cookies/
+tokens) to investigate exactly that, without guessing another locator:
+
+- `_redact_url()` -- redacts query-parameter *values* whose name looks
+  session/auth/token-shaped (`id`, `key`, `session`, `token`, `ticket`,
+  `sid`, `xsrf`, `csrf`, etc. -- see `SENSITIVE_URL_PARAM_NAMES`) before
+  any URL is printed, since the popup's own URL embeds an opaque `id`
+  value that behaves like a session/ticket identifier. Never raises --
+  an unparseable value prints as `[unparseable URL]`.
+- `_FRAME_INSPECTION_SCRIPT` + `_inspect_frame()` -- a single JS snippet,
+  evaluated per-frame (main and nested), that reports: body
+  `innerHTML` length and a 3000-char-truncated `innerText`, every
+  visible button/`[role="button"]`/`[role="menuitem"]` (tag, text,
+  aria-label, title, `data-tb-test-id`, class), every visible element
+  whose text/aria-label/title matches `/download/i`, nested `<iframe>`
+  `src`/`name`/`id`, a recursive (depth-capped) walk of open shadow
+  roots for the same button/download-text info, every `<canvas>`'s
+  dimensions plus its parent/grandparent `outerHTML` (truncated) --
+  covering the "it's canvas-rendered, not real DOM" hypothesis -- and a
+  3000-char `outerHTML` preview of the whole document. `_inspect_frame()`
+  wraps this in try/except and returns `{"error": ...}` instead of
+  raising, so one broken frame never stops the others from being
+  inspected.
+- `_debug_dump_view_data_popup()` now enumerates `view_data_page.frames`
+  and runs `_inspect_frame()` on each one (redacting `src` on any
+  reported iframe before printing it), and separately enumerates
+  `view_data_page.context.pages` -- other pages open in the same browser
+  context -- printing each one's (redacted) URL and title, to check
+  whether the real "View Data" UI is actually a distinct page rather
+  than a frame within this popup at all. Every step remains
+  independently try/excepted, so a single failure (e.g. `.frames`
+  enumeration itself failing) is reported inline and never blocks the
+  rest of the dump or the real export attempt that follows.
+
+Regression tests (`tests/test_browser_crosstab.py`) cover `_redact_url()`
+(sensitive params redacted, non-sensitive ones like a `sheet` param
+preserved, and a genuinely unparseable input never raising), `_inspect_frame()`
+(returns the frame's `evaluate()` result normally, and `{"error": ...}`
+without raising when `evaluate()` throws), and the extended
+`_debug_dump_view_data_popup()` (prints per-frame and context-page
+diagnostics with a redacted URL, and never raises even when title(),
+screenshot(), frame enumeration, per-frame evaluation, and context-page
+enumeration all fail at once). **Not yet run against the real server**
+-- this is, again, the very diagnostic meant to produce that data; once
+its output (which frame/shadow-root/canvas/context-page actually holds
+the Download control) is shared back, `VIEW_DATA_DOWNLOAD_BUTTON_CANDIDATES`
+should be corrected to target it precisely, and the debug instrumentation
+(`_redact_url`'s callers inside `_debug_dump_view_data_popup`,
+`_FRAME_INSPECTION_SCRIPT`, `_inspect_frame`, `_debug_dump_view_data_popup`
+itself, and its call site in `_export_crosstab_csv`) removed.
+
 ## What is tested vs. not
 
 Tested in this environment (`pytest`, no network):
@@ -542,11 +605,17 @@ Tested in this environment (`pytest`, no network):
   the correct timestamped filename, plus the overlay-wait-before-click
   regression cases -- overlays clearing normally, a stuck overlay, and a
   missing button -- each producing a clean `BrowserAutomationError`
-  instead of a raw Playwright traceback), `_debug_dump_view_data_popup()`
-  (temporary debug-only instrumentation: prints URL/title/buttons/
-  Download-text matches, saves a screenshot, all independently
-  try/excepted so any failure here is reported but never blocks the real
-  export), and `run_browser_crosstab_export()`'s orchestration (goto
+  instead of a raw Playwright traceback), `_redact_url()` (sensitive
+  query-parameter values redacted, non-sensitive ones preserved, never
+  raises on unparseable input), `_inspect_frame()` (returns a frame's
+  `evaluate()` result normally, or `{"error": ...}` without raising when
+  `evaluate()` throws), `_debug_dump_view_data_popup()` (temporary
+  debug-only instrumentation: prints URL/title, per-frame DOM diagnostics
+  -- buttons, Download-text matches, iframes, shadow roots, canvases --
+  and other browser-context pages, with URLs redacted, saves a
+  screenshot, all independently try/excepted so any single failure here
+  is reported but never blocks the real export), and
+  `run_browser_crosstab_export()`'s orchestration (goto
   order, browser launch args, browser always closed), all using
   hand-built fake
   Playwright-like objects -- no real browser, no real Tableau DOM.

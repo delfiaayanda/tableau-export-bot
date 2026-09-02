@@ -19,7 +19,9 @@ from src.exportbot.browser_crosstab import (
     _export_crosstab_csv,
     _export_from_view_data_popup,
     _find_first,
+    _inspect_frame,
     _login_if_needed,
+    _redact_url,
     _wait_for_dashboard,
     generate_export_filename,
     resolve_executable_path,
@@ -180,94 +182,171 @@ class ViewDataPopupPage:
         return _DownloadCM(self._download)
 
 
-class DebugDumpPage:
-    """Fake for _debug_dump_view_data_popup()'s target page: exposes
-    .url, .title(), .screenshot(), and .evaluate() (dispatching the three
-    expected calls -- buttons, download-text elements, toolbar HTML -- by
-    call order), each independently able to raise to prove the dump never
-    lets a diagnostic failure break the caller."""
+def test_redact_url_redacts_sensitive_params_but_keeps_others():
+    url = (
+        "https://insight.example.com/vizql/v_test/hybrid-window/min/index.html"
+        "?id=8C4A1AEB8A024C0AA761D90468368731&moduleId=view_data&sheet=Summary"
+    )
+    redacted = _redact_url(url)
+    assert "8C4A1AEB8A024C0AA761D90468368731" not in redacted
+    assert "id=REDACTED" in redacted
+    assert "moduleId=view_data" in redacted
+    assert "sheet=Summary" in redacted
+    assert redacted.startswith("https://insight.example.com/vizql/v_test/hybrid-window/min/index.html")
 
-    def __init__(
-        self,
-        url="https://insight.example.com/vizql/v_test/hybrid-window/min/index.html",
-        title="View Data: Persentase Nasional",
-        buttons=None,
-        download_elements=None,
-        toolbar_html=None,
-        title_raises=False,
-        screenshot_raises=False,
-        evaluate_raises=False,
-    ):
+
+def test_redact_url_never_raises_on_unparseable_input():
+    assert _redact_url(object()) == "[unparseable URL]"
+
+
+class FakeFrame:
+    def __init__(self, url="https://insight.example.com/frame", name="", evaluate_result=None, evaluate_raises=False):
+        self.url = url
+        self.name = name
+        self._evaluate_result = evaluate_result if evaluate_result is not None else {}
+        self._evaluate_raises = evaluate_raises
+
+    def evaluate(self, script):
+        if self._evaluate_raises:
+            raise RuntimeError("evaluate failed")
+        return self._evaluate_result
+
+
+def test_inspect_frame_returns_evaluate_result():
+    expected = {"body_inner_html_length": 42, "buttons": []}
+    frame = FakeFrame(evaluate_result=expected)
+    assert _inspect_frame(frame) == expected
+
+
+def test_inspect_frame_returns_error_dict_on_exception():
+    frame = FakeFrame(evaluate_raises=True)
+    result = _inspect_frame(frame)
+    assert "error" in result
+    assert "evaluate failed" in result["error"]
+
+
+class FakeContextPage:
+    def __init__(self, url, title, title_raises=False):
         self.url = url
         self._title = title
-        self._buttons = buttons if buttons is not None else []
-        self._download_elements = download_elements if download_elements is not None else []
-        self._toolbar_html = toolbar_html
         self._title_raises = title_raises
-        self._evaluate_raises = evaluate_raises
-        self._evaluate_call_count = 0
-        self.screenshot = MagicMock(
-            side_effect=RuntimeError("screenshot failed") if screenshot_raises else None
-        )
 
     def title(self):
         if self._title_raises:
             raise RuntimeError("title failed")
         return self._title
 
-    def evaluate(self, script):
-        if self._evaluate_raises:
-            raise RuntimeError("evaluate failed")
-        self._evaluate_call_count += 1
-        if self._evaluate_call_count == 1:
-            return self._buttons
-        if self._evaluate_call_count == 2:
-            return self._download_elements
-        return self._toolbar_html
+
+class FakeContext:
+    def __init__(self, pages):
+        self.pages = pages
 
 
-def test_debug_dump_view_data_popup_prints_diagnostics_and_saves_screenshot(tmp_path, capsys):
-    buttons = [
-        {
-            "tag": "BUTTON",
-            "inner_text": "Download",
-            "aria_label": "Download",
-            "role": None,
-            "data_tb_test_id": "download-Button",
-            "title": None,
-        }
-    ]
-    download_elements = [
-        {
-            "tag": "DIV",
-            "text": "Download",
-            "aria_label": None,
-            "title": None,
-            "data_tb_test_id": None,
-            "class_name": "toolbar-item",
-        }
-    ]
-    toolbar_html = {
-        "element_html": "<div>Download</div>",
-        "parent_html": '<div class="toolbar">...</div>',
-        "grandparent_html": None,
-    }
-    page = DebugDumpPage(buttons=buttons, download_elements=download_elements, toolbar_html=toolbar_html)
+class RaisingContext:
+    """A .context stand-in whose .pages access always raises -- used to
+    confirm context-page enumeration failures are caught, without
+    polluting shared classes like MagicMock."""
 
-    _debug_dump_view_data_popup(page, tmp_path)
+    @property
+    def pages(self):
+        raise RuntimeError("context failed")
 
-    page.screenshot.assert_called_once_with(path=str(tmp_path / "debug_view_data_popup.png"))
+
+class DebugDumpPage:
+    """Fake for _debug_dump_view_data_popup()'s target page, matching the
+    frame-based + context-based implementation: exposes .url, .title(),
+    .screenshot(), .frames (a list of FakeFrame, each inspected via
+    _inspect_frame()), and .context.pages (other pages in the same
+    browser context) -- since the real popup's own top-level document
+    turned out to have zero buttons/download-text and a generic
+    "Hybrid Popup Window" title, meaning the real content lives in a
+    frame, shadow root, or a different context page."""
+
+    def __init__(
+        self,
+        url="https://insight.example.com/vizql/v_test/hybrid-window/min/index.html?id=SECRET123",
+        title="Hybrid Popup Window",
+        frames=None,
+        context_pages=None,
+        title_raises=False,
+        screenshot_raises=False,
+        frames_raise=False,
+        context_raises=False,
+    ):
+        self.url = url
+        self._title = title
+        self._title_raises = title_raises
+        self._frames = frames if frames is not None else []
+        self._frames_raise = frames_raise
+        self.screenshot = MagicMock(
+            side_effect=RuntimeError("screenshot failed") if screenshot_raises else None
+        )
+        if context_raises:
+            self.context = RaisingContext()
+        else:
+            self.context = FakeContext(context_pages if context_pages is not None else [])
+
+    def title(self):
+        if self._title_raises:
+            raise RuntimeError("title failed")
+        return self._title
+
+    @property
+    def frames(self):
+        if self._frames_raise:
+            raise RuntimeError("frames failed")
+        return self._frames
+
+
+def test_debug_dump_view_data_popup_prints_frame_and_context_diagnostics(tmp_path, capsys):
+    main_frame = FakeFrame(
+        url="https://insight.example.com/vizql/v_test/hybrid-window/min/index.html",
+        name="",
+        evaluate_result={
+            "body_inner_html_length": 0,
+            "body_inner_text": "",
+            "buttons": [],
+            "download_elements": [],
+            "iframes": [{"src": "https://insight.example.com/inner?token=SECRET", "name": "inner", "id": "f1"}],
+            "shadow_roots": [],
+            "canvases": [{"width": 800, "height": 600, "client_width": 800, "client_height": 600}],
+            "html_preview": "<html>...</html>",
+        },
+    )
+    other_page = FakeContextPage(
+        url="https://insight.example.com/#/views/ReturnRotate/Dashboard1?:id=1", title="Dashboard"
+    )
+    view_data_page = DebugDumpPage(frames=[main_frame], context_pages=[other_page])
+
+    _debug_dump_view_data_popup(view_data_page, tmp_path)
+
+    view_data_page.screenshot.assert_called_once_with(path=str(tmp_path / "debug_view_data_popup.png"))
     out = capsys.readouterr().out
-    assert "popup.url" in out
-    assert "View Data: Persentase Nasional" in out
-    assert "download-Button" in out
-    assert "toolbar-item" in out
-    assert "<div class=\"toolbar\">" in out
+    assert "Hybrid Popup Window" in out
+    assert "popup.frames (1)" in out
+    assert "SECRET" not in out
+    assert "browser context has 1 page(s)" in out
+    assert "Dashboard" in out
 
 
 def test_debug_dump_view_data_popup_never_raises_despite_every_step_failing(tmp_path):
-    page = DebugDumpPage(title_raises=True, screenshot_raises=True, evaluate_raises=True)
-    _debug_dump_view_data_popup(page, tmp_path)  # must not raise
+    view_data_page = DebugDumpPage(
+        title_raises=True,
+        screenshot_raises=True,
+        frames_raise=True,
+        context_raises=True,
+    )
+    _debug_dump_view_data_popup(view_data_page, tmp_path)  # must not raise
+
+
+def test_debug_dump_view_data_popup_reports_per_frame_evaluate_failure(tmp_path, capsys):
+    broken_frame = FakeFrame(evaluate_raises=True)
+    view_data_page = DebugDumpPage(frames=[broken_frame])
+
+    _debug_dump_view_data_popup(view_data_page, tmp_path)  # must not raise
+
+    out = capsys.readouterr().out
+    assert "evaluate() failed" in out
 
 
 def test_generate_export_filename_format():

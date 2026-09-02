@@ -31,8 +31,28 @@ import os
 import re
 import time
 from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from .exceptions import BrowserAutomationError
+
+# Query parameter names redacted from any URL before it's printed --
+# Tableau's own popup/tempfile URLs embed session/ticket-like values
+# under names like these (e.g. the "View Data" popup's own
+# ".../index.html?id=...&moduleId=view_data").
+SENSITIVE_URL_PARAM_NAMES = {
+    "id",
+    "key",
+    "session",
+    "sessionid",
+    "session_id",
+    "token",
+    "auth",
+    "authtoken",
+    "ticket",
+    "sid",
+    "xsrf",
+    "csrf",
+}
 
 DASHBOARD_URL = "https://insight.erajaya.com/#/views/ReturnRotate/Dashboard1?:id=1"
 EXPORT_FILENAME_PREFIX = "ReturnRotate"
@@ -272,14 +292,142 @@ def _export_crosstab_csv(page, export_dir: Path):
     return _export_from_view_data_popup(view_data_page, export_dir)
 
 
+def _redact_url(url: str) -> str:
+    """Redacts query parameter VALUES whose name looks session/auth/token
+    related (see SENSITIVE_URL_PARAM_NAMES), so a URL is safe to print
+    even though it may embed Tableau's own internal session/ticket
+    identifiers (as seen in the "View Data" popup's own URL). Never
+    touches the scheme/host/path, and never raises -- an unparseable URL
+    is reported as such rather than printed raw."""
+    try:
+        parts = urlsplit(url)
+        redacted_params = [
+            (name, "REDACTED" if name.lower() in SENSITIVE_URL_PARAM_NAMES else value)
+            for name, value in parse_qsl(parts.query, keep_blank_values=True)
+        ]
+        redacted_query = urlencode(redacted_params)
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, redacted_query, parts.fragment))
+    except Exception:
+        return "[unparseable URL]"
+
+
+# Evaluated once per frame (including the main frame) by _inspect_frame().
+# Reads only visible UI text/attributes and structural DOM shape -- never
+# cookies, storage, or anything credential-shaped. Covers plain DOM
+# (buttons, "Download" text matches, nested iframes), canvas-rendered UI
+# (dimensions + surrounding HTML, since Tableau sometimes renders via
+# canvas/WebGL rather than plain DOM elements), and open shadow DOM
+# (recursively, since a Tableau "hybrid" popup could plausibly use web
+# components that hide their real content behind a shadow root).
+_FRAME_INSPECTION_SCRIPT = """
+() => {
+    function isVisible(el) {
+        return !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+    }
+    function summarize(el) {
+        return {
+            tag: el.tagName,
+            text: (el.innerText || el.textContent || '').trim().slice(0, 80),
+            aria_label: el.getAttribute('aria-label'),
+            title: el.getAttribute('title'),
+            data_tb_test_id: el.getAttribute('data-tb-test-id'),
+            class_name: el.className && el.className.toString ? el.className.toString().slice(0, 120) : String(el.className),
+        };
+    }
+    function looksLikeDownload(el) {
+        const text = (el.innerText || el.textContent || '');
+        const aria = el.getAttribute('aria-label') || '';
+        const title = el.getAttribute('title') || '';
+        return (/download/i.test(text) && text.trim().length < 60) || /download/i.test(aria) || /download/i.test(title);
+    }
+
+    const body = document.body;
+    const bodyInnerHtmlLength = body ? body.innerHTML.length : 0;
+    const bodyInnerText = body ? (body.innerText || '').slice(0, 3000) : '';
+
+    const buttons = Array.from(document.querySelectorAll('button, [role="button"], [role="menuitem"]'))
+        .filter(isVisible)
+        .map(summarize);
+
+    const downloadElements = Array.from(document.querySelectorAll('*'))
+        .filter(el => looksLikeDownload(el) && isVisible(el))
+        .slice(0, 20)
+        .map(summarize);
+
+    const iframes = Array.from(document.querySelectorAll('iframe')).map(f => ({
+        src: f.src || null,
+        name: f.name || null,
+        id: f.id || null,
+    }));
+
+    function inspectShadowRoots(root, depth) {
+        if (depth > 5) return [];
+        const results = [];
+        for (const el of root.querySelectorAll('*')) {
+            if (el.shadowRoot) {
+                results.push({
+                    host_tag: el.tagName,
+                    host_class: el.className ? String(el.className).slice(0, 120) : null,
+                    buttons: Array.from(el.shadowRoot.querySelectorAll('button, [role="button"]'))
+                        .filter(isVisible).map(summarize),
+                    download_elements: Array.from(el.shadowRoot.querySelectorAll('*'))
+                        .filter(looksLikeDownload).slice(0, 10).map(summarize),
+                });
+                results.push(...inspectShadowRoots(el.shadowRoot, depth + 1));
+            }
+        }
+        return results;
+    }
+    const shadowRoots = inspectShadowRoots(document, 0);
+
+    const canvases = Array.from(document.querySelectorAll('canvas')).map(c => {
+        const parent = c.parentElement;
+        const grandparent = parent ? parent.parentElement : null;
+        return {
+            width: c.width,
+            height: c.height,
+            client_width: c.clientWidth,
+            client_height: c.clientHeight,
+            parent_html: parent && parent.outerHTML ? parent.outerHTML.slice(0, 500) : null,
+            grandparent_html: grandparent && grandparent.outerHTML ? grandparent.outerHTML.slice(0, 500) : null,
+        };
+    });
+
+    const htmlPreview = document.documentElement ? document.documentElement.outerHTML.slice(0, 3000) : '';
+
+    return {
+        body_inner_html_length: bodyInnerHtmlLength,
+        body_inner_text: bodyInnerText,
+        buttons: buttons,
+        download_elements: downloadElements,
+        iframes: iframes,
+        shadow_roots: shadowRoots,
+        canvases: canvases,
+        html_preview: htmlPreview,
+    };
+}
+"""
+
+
+def _inspect_frame(frame) -> dict:
+    """Runs _FRAME_INSPECTION_SCRIPT against a single frame (main or
+    nested), returning its result dict or {"error": "..."} on failure.
+    Never raises."""
+    try:
+        return frame.evaluate(_FRAME_INSPECTION_SCRIPT)
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
 def _debug_dump_view_data_popup(view_data_page, export_dir: Path) -> None:
     """TEMPORARY DEBUG ONLY: dumps DOM diagnostics for the "View Data"
     popup so its real Download control can be identified precisely
     instead of guessed. Entirely best-effort -- every failure here is
     caught and reported, never allowed to break the actual export
-    attempt that follows. Prints only visible UI text/attributes and
-    saves a screenshot; never touches credentials, cookies, or tokens."""
-    print(f"[DEBUG] popup.url = {view_data_page.url}")
+    attempt that follows. Prints only visible UI text/attributes/structure
+    and saves a screenshot; never credentials, cookies, tokens, or
+    XSRF/session/auth values (URLs are redacted before printing)."""
+    print(f"[DEBUG] popup.url = {_redact_url(view_data_page.url)}")
     try:
         print(f"[DEBUG] popup.title() = {view_data_page.title()}")
     except Exception as exc:
@@ -293,80 +441,70 @@ def _debug_dump_view_data_popup(view_data_page, export_dir: Path) -> None:
     except Exception as exc:
         print(f"[DEBUG] screenshot failed: {exc}")
 
-    buttons_script = """
-() => Array.from(document.querySelectorAll('button, [role="button"], [role="menuitem"]'))
-    .filter(el => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length))
-    .map(el => ({
-        tag: el.tagName,
-        inner_text: (el.innerText || '').trim().slice(0, 80),
-        aria_label: el.getAttribute('aria-label'),
-        role: el.getAttribute('role'),
-        data_tb_test_id: el.getAttribute('data-tb-test-id'),
-        title: el.getAttribute('title'),
-    }))
-"""
     try:
-        buttons = view_data_page.evaluate(buttons_script)
+        frames = list(view_data_page.frames)
     except Exception as exc:
-        buttons = []
-        print(f"[DEBUG] button enumeration failed: {exc}")
+        frames = []
+        print(f"[DEBUG] popup.frames enumeration failed: {exc}")
 
-    print(f"[DEBUG] visible buttons/menuitems ({len(buttons)}):")
-    for button in buttons:
-        print(f"[DEBUG]   {button}")
+    print(f"[DEBUG] popup.frames ({len(frames)}):")
+    for index, frame in enumerate(frames):
+        try:
+            print(f"[DEBUG]   frame[{index}] url={_redact_url(frame.url)} name={frame.name!r}")
+        except Exception as exc:
+            print(f"[DEBUG]   frame[{index}] inspection of url/name failed: {exc}")
 
-    download_text_script = """
-() => Array.from(document.querySelectorAll('*'))
-    .filter(el => {
-        const text = (el.innerText || el.textContent || '');
-        return text && /download/i.test(text) && text.trim().length < 60
-            && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
-    })
-    .slice(0, 20)
-    .map(el => ({
-        tag: el.tagName,
-        text: (el.innerText || el.textContent || '').trim().slice(0, 80),
-        aria_label: el.getAttribute('aria-label'),
-        title: el.getAttribute('title'),
-        data_tb_test_id: el.getAttribute('data-tb-test-id'),
-        class_name: el.className && el.className.toString ? el.className.toString().slice(0, 120) : String(el.className),
-    }))
-"""
+    for index, frame in enumerate(frames):
+        print(f"[DEBUG] --- frame[{index}] DOM inspection ---")
+        info = _inspect_frame(frame)
+        if "error" in info:
+            print(f"[DEBUG]   frame[{index}] evaluate() failed: {info['error']}")
+            continue
+
+        print(f"[DEBUG]   body_inner_html_length = {info.get('body_inner_html_length')}")
+        print(f"[DEBUG]   body_inner_text (truncated) = {info.get('body_inner_text')!r}")
+
+        buttons = info.get("buttons", [])
+        print(f"[DEBUG]   visible buttons/menuitems ({len(buttons)}):")
+        for button in buttons:
+            print(f"[DEBUG]     {button}")
+
+        download_elements = info.get("download_elements", [])
+        print(f"[DEBUG]   elements containing 'Download' ({len(download_elements)}):")
+        for element in download_elements:
+            print(f"[DEBUG]     {element}")
+
+        iframes = info.get("iframes", [])
+        print(f"[DEBUG]   nested iframes ({len(iframes)}):")
+        for iframe in iframes:
+            iframe_redacted = dict(iframe)
+            if iframe_redacted.get("src"):
+                iframe_redacted["src"] = _redact_url(iframe_redacted["src"])
+            print(f"[DEBUG]     {iframe_redacted}")
+
+        shadow_roots = info.get("shadow_roots", [])
+        print(f"[DEBUG]   open shadow roots ({len(shadow_roots)}):")
+        for shadow in shadow_roots:
+            print(f"[DEBUG]     {shadow}")
+
+        canvases = info.get("canvases", [])
+        print(f"[DEBUG]   canvas elements ({len(canvases)}):")
+        for canvas in canvases:
+            print(f"[DEBUG]     {canvas}")
+
+        print(f"[DEBUG]   html_preview (truncated) = {info.get('html_preview')!r}")
+
     try:
-        download_elements = view_data_page.evaluate(download_text_script)
+        context_pages = view_data_page.context.pages
+        print(f"[DEBUG] browser context has {len(context_pages)} page(s):")
+        for index, context_page in enumerate(context_pages):
+            try:
+                page_title = context_page.title()
+            except Exception as exc:
+                page_title = f"<title() failed: {exc}>"
+            print(f"[DEBUG]   page[{index}] url={_redact_url(context_page.url)} title={page_title!r}")
     except Exception as exc:
-        download_elements = []
-        print(f"[DEBUG] 'download' text element search failed: {exc}")
-
-    print(f"[DEBUG] elements containing 'Download' text ({len(download_elements)}):")
-    for element in download_elements:
-        print(f"[DEBUG]   {element}")
-
-    toolbar_html_script = """
-() => {
-    const candidates = Array.from(document.querySelectorAll('*')).filter(el => {
-        const text = (el.innerText || el.textContent || '');
-        return text && /download/i.test(text) && text.trim().length < 60
-            && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
-    });
-    if (candidates.length === 0) return null;
-    const el = candidates[0];
-    const parent = el.parentElement;
-    const grandparent = parent ? parent.parentElement : null;
-    return {
-        element_html: el.outerHTML ? el.outerHTML.slice(0, 500) : null,
-        parent_html: parent && parent.outerHTML ? parent.outerHTML.slice(0, 1500) : null,
-        grandparent_html: grandparent && grandparent.outerHTML ? grandparent.outerHTML.slice(0, 2000) : null,
-    };
-}
-"""
-    try:
-        toolbar_html = view_data_page.evaluate(toolbar_html_script)
-    except Exception as exc:
-        toolbar_html = None
-        print(f"[DEBUG] toolbar HTML dump failed: {exc}")
-
-    print(f"[DEBUG] toolbar HTML around first 'Download' match: {toolbar_html}")
+        print(f"[DEBUG] browser context page enumeration failed: {exc}")
 
 
 def _export_from_view_data_popup(view_data_page, export_dir: Path) -> Path:
