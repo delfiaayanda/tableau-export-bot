@@ -84,6 +84,24 @@ without a live run; it's recorded here as the next thing to check if the
 new diagnostics above show the popup truly never does anything on its
 own.
 
+**Resolved:** the "does it hydrate at all" question above turned out to
+have a mundane answer once the diagnostics actually ran on current code
+(an earlier "still empty" run was later found to have been executed
+against a stale, pre-diagnostics checkout -- see CLAUDE.md). On the real
+current code, the popup DOES hydrate: it fires its own JS bundle
+requests, its console logs "Browser based plugin load finished", it has
+`window.opener` set, and it receives a real `postMessage` from its
+opener. `_switch_to_full_data_and_download()` then found and clicked
+"Full Data" successfully -- and `_describe_locator()` revealed why the
+FULL_DATA_TAB_CANDIDATES role-based entries were dead weight while
+get_by_text() was the one that matched: the real element is a plain
+`<span>` with no `role` and no `aria-label` at all, only visible text.
+`VIEW_DATA_DOWNLOAD_BUTTON_CANDIDATES` is now updated the same way
+(get_by_text() first, plus a couple of additional low-risk fallbacks --
+see the comment above that list) on the reasonable, evidence-based
+assumption that "Download" is built with the same UI toolkit as "Full
+Data". Not yet confirmed live.
+
 NOT exercised against the real server from this environment: no browser
 binary is installed here (Chromium download is blocked by this sandbox's
 network policy) and network access to insight.erajaya.com is blocked
@@ -177,23 +195,38 @@ DOWNLOAD_BUTTON_CANDIDATES = [
 
 # The "View Data" popup's own UI -- confirmed by the HAR to require two
 # real clicks to reach Full Data (it is not the popup's default tab):
-# switch to "Full Data", then click "Download". An earlier one-shot DOM
-# diagnostic run immediately after domcontentloaded found zero buttons,
-# but that only proves the popup hadn't finished hydrating at that exact
-# instant -- not that it has no DOM (see module docstring). Best-effort,
-# accessible-role-first like every other selector list in this module;
-# not yet confirmed against the live popup's actual markup.
+# switch to "Full Data", then click "Download". A real-server run then
+# confirmed exactly how this popup is actually built: _describe_locator()
+# showed the matched "Full Data" control is a plain `<span>` with NO
+# `role` and NO `aria-label` at all -- it only has visible text -- so
+# every accessible-role-based candidate below it (tab/button/menuitem)
+# can never match anything in this popup; only get_by_text() can. Both
+# lists now try get_by_text() FIRST (confirmed to work for Full Data;
+# the Download button is presumed built the same way, from the same
+# popup's own UI toolkit) and keep the role-based/CSS candidates as a
+# low-cost fallback in case a future Tableau version adds real ARIA
+# semantics.
 FULL_DATA_TAB_CANDIDATES = [
+    lambda s: s.get_by_text(re.compile(r"^full data$", re.I)),
     lambda s: s.get_by_role("tab", name=re.compile(r"^full data$", re.I)),
     lambda s: s.get_by_role("button", name=re.compile(r"^full data$", re.I)),
     lambda s: s.get_by_role("menuitem", name=re.compile(r"^full data$", re.I)),
-    lambda s: s.get_by_text(re.compile(r"^full data$", re.I)),
 ]
 
 VIEW_DATA_DOWNLOAD_BUTTON_CANDIDATES = [
-    lambda s: s.get_by_role("button", name=re.compile(r"^download$", re.I)),
+    lambda s: s.get_by_text(re.compile(r"^download$", re.I)),
+    # Broader than the exact-text match above: a real-server run found
+    # this popup's controls carry no ARIA role/label at all (see comment
+    # above), so if "Download" turns out to be an icon button whose only
+    # accessible text isn't an exact match (e.g. it's wrapped with other
+    # text, or exposed via `title` instead), these catch it without
+    # widening all the way to an unanchored get_by_text() (too easily
+    # matches an unrelated container element and clicks the wrong thing).
+    lambda s: s.get_by_role("button", name=re.compile(r"download", re.I)),
+    lambda s: s.get_by_title(re.compile(r"download", re.I)),
     lambda s: s.locator('[data-tb-test-id="download-Button"]'),
     lambda s: s.locator('button[aria-label="Download" i]'),
+    lambda s: s.locator('[aria-label*="download" i]'),
 ]
 
 PASSWORD_FIELD_CANDIDATES = [
@@ -762,6 +795,13 @@ def _switch_to_full_data_and_download(view_data_page, export_dir: Path) -> None:
     print("Switching to Full Data...")
     print(f"[POPUPDEBUG] Full Data candidate matched: {_describe_locator(full_data_tab)}")  # TEMPORARY DEBUG ONLY
     full_data_tab.click()
+
+    # TEMPORARY DEBUG ONLY -- reuses the existing DOM dump a second time,
+    # now that the Full Data click should have taken effect, so a failure
+    # to find Download next shows exactly what the popup's DOM actually
+    # contains at that point (did the click render anything new at all?)
+    # instead of another blind locator guess.
+    _debug_dump_view_data_popup(view_data_page, export_dir)
 
     download_button = _find_first_with_wait(
         view_data_page, VIEW_DATA_DOWNLOAD_BUTTON_CANDIDATES, VIEW_DATA_POPUP_TIMEOUT_MS

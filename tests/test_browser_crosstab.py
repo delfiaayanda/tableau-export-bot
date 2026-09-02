@@ -904,6 +904,10 @@ class DelayedViewDataPopupPage:
         self.download_button = FakeLocator()
         self.wait_for_timeout = MagicMock(side_effect=self._tick)
         self.screenshot = MagicMock()
+        self.url = "https://insight.example.com/vizql/w/ReturnRotate/v/Dashboard1/hybrid-window/min/index.html"
+
+    def title(self):
+        return "Hybrid Popup Window"
 
     def _tick(self, *args, **kwargs):
         self._ticks += 1

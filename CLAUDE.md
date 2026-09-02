@@ -1181,6 +1181,74 @@ element `_switch_to_full_data_and_download()` actually matched and
 clicked) is shared back, the actual root cause -- and a real, evidence-
 based fix -- can finally be identified instead of guessed at.
 
+### Stale local checkout, then the real Download locator gap
+
+**A user then ran `browser_crosstab.py` and got output with zero
+`[POPUPDEBUG]` lines** -- just the old `[DEBUG]` popup dump followed by
+`"Exporting Crosstab..."` and a bare tempfile timeout. That exact string
+does not exist anywhere in this codebase past commit `5981b6c` (it was
+removed when `_switch_to_full_data_and_download()` was added), which
+proved the run was against a stale local checkout at least 3 commits
+behind `origin` -- not a defect in the diagnostics. Confirmed via `git
+log -S "Exporting Crosstab"` showing the string was only ever present
+between the very first commit and `5981b6c`. Fixed by syncing (`git
+fetch` + `git pull`) rather than any code change.
+
+**On the correct code, the diagnostics immediately answered the
+hydration question posed in the previous round, decisively: the popup
+DOES hydrate.** The real run showed: `window.opener present = True`,
+`window.name length = 50`, one `postMessage` received from
+`insight.erajaya.com` (shape `object(keys=windowId,messageType,data)`),
+the popup's own JS bundle requests (`hybrid-web-window.js`,
+`hybrid-window/min/0.js`/`1.js`, locale files) firing and succeeding,
+and a console log reading `"Browser based plugin load finished elapsed
+time: 1099ms"`. There was never a hydration bug -- the empty-DOM
+readings from the two prior rounds were from the stale checkout too (no
+`_switch_to_full_data_and_download()` at all in that code, so nothing
+had ever actually waited for or clicked anything).
+
+`_switch_to_full_data_and_download()` then found and clicked "Full
+Data" successfully. `_describe_locator()`'s output explained exactly why
+only one candidate in `FULL_DATA_TAB_CANDIDATES` could ever have worked:
+the matched element is `{"tag":"SPAN","role":null,"ariaLabel":null,"text":"Full
+Data"}` -- a plain span with no ARIA role or accessible name, matched
+only by `get_by_text()`. The three role-based candidates (`tab`,
+`button`, `menuitem`) could never match anything in this popup, since
+Playwright's `get_by_role()` requires an actual (or implicit) ARIA role
+to exist. The run then failed at the very next step: `Could not find the
+"Download" button in the View Data window after switching to Full
+Data.` -- because `VIEW_DATA_DOWNLOAD_BUTTON_CANDIDATES` had no
+`get_by_text()` fallback at all, only role/CSS-attribute candidates that
+this popup's markup apparently never satisfies.
+
+**Fix:** both candidate lists now try `get_by_text()` first (confirmed
+to work for "Full Data"; "Download" is presumed built with the same UI
+toolkit, since it's the same popup). `VIEW_DATA_DOWNLOAD_BUTTON_CANDIDATES`
+also gained two additional narrow fallbacks -- a `get_by_role("button",
+name=~"download")` substring match and a `get_by_title(~"download")`
+match -- in case the real control turns out to be an icon-only button
+whose accessible name isn't an exact "Download" text match; a fully
+unanchored `get_by_text("download")` was deliberately NOT added, since
+without ARIA scoping that's the kind of broad match that can grab an
+unrelated container element and click the wrong thing. `_switch_to_full_data_and_download()`
+also now calls the existing `_debug_dump_view_data_popup()` a second
+time, right after the "Full Data" click and before searching for
+Download -- reusing already-tested instrumentation rather than adding
+new instrumentation, so that if the widened Download candidates still
+don't match on the next run, the exact post-click DOM state (button
+list, download-text matches, HTML preview) is already captured instead
+of requiring another guess-and-rerun cycle.
+
+Regression tests: `DelayedViewDataPopupPage` gained `.url`/`.title()` so
+the new mid-function `_debug_dump_view_data_popup()` call doesn't crash
+in that timing-regression test; all other existing tests needed no
+changes, since the fakes route every `get_by_*`/`locator()` call through
+the same scripted-locator mechanism regardless of which specific method
+is called. Full suite: 143 passed. **Not yet run against the real
+server** -- the next run is what will show whether the widened Download
+candidates actually match, and if not, the reused DOM dump's output is
+the next concrete evidence to act on.
+
 ## What is tested vs. not
 
 Tested in this environment (`pytest`, no network):
