@@ -3,58 +3,60 @@
 Login and dashboard navigation reproduce the exact manual workflow
 already confirmed to work in the live Tableau UI: open Tableau, log in,
 load the dashboard, click Download -> Data. That click opens a separate
-"View Data" popup window (titled "Hybrid Popup Window") -- and a
-real-server run proved this popup's own JS then runs the ENTIRE HAR
-export sequence (see CLAUDE.md, "Native UI Crosstab download")
-automatically by itself: `export-view-data-summary-to-csv-server` POSTs
-and succeeds, then the resulting `tempfile` GET fires and returns the
-real CSV -- with no further click, no VizQL session to discover, and no
-command issued by this project at all. This explains everything earlier
-investigation found confusing: the popup's DOM is entirely empty (0
-buttons, 0 frames with content) because it is a background worker, not a
-dialog for a human to interact with; the main dashboard's own Download
-button is real but irrelevant here (Tableau's own dialog overlay blocks
-it while this popup is open, and clicking it again was never going to
-trigger anything).
+"View Data" popup window (titled "Hybrid Popup Window") whose own JS
+runs Tableau's real VizQL export machinery -- this project never issues
+any VizQL command itself; it drives the same UI a person would and
+captures the resulting file over the network (see below).
 
-Two earlier versions tried to *reconstruct* this flow instead of
-capturing it: first by observing Tableau's bootstrap VizQL commands via
-network listeners (attached at various points -- both timed out having
-captured nothing, since the commands weren't reliably observable that
-way here), then by *discovering* an already-active VizQL session from
-Performance Resource Timing entries and cookies and reissuing the
-export/tempfile commands via `page.context.request` -- which reached
-the real server but failed at the discovery step, while this project's
-own OWN diagnostic-only network logger (still attached alongside,
-unchanged) had already observed the real popup completing the entire
-export successfully in the background. That was the actual evidence:
-nothing needed reconstructing.
+A real HAR capture of the exact manual "Full Data" workflow (open View
+Data -> click "Full Data" -> click "Download") is this project's ground
+truth for what that popup actually needs (see CLAUDE.md, "The Full Data
+export needs real UI clicks"). It showed two things a prior version got
+wrong:
 
-`_attach_export_network_diagnostics()` now takes an optional
-`_TempfileCapture` and, alongside its existing (unchanged) request/
-response logging, snapshots the first real `.../tempfile/...` response
-it sees via `_capture_tempfile_response()`. `_wait_for_tempfile_capture()`
-polls (no fixed sleep) until that capture is populated or times out.
+  - The popup does NOT default to Full Data. Left alone, it exports
+    "Summary" (`export-view-data-summary-to-csv-server`), which never
+    appears at all in the manual Full Data HAR. The real target is
+    `export-view-data-underlying-to-csv-server`, fired only after
+    switching to the "Full Data" tab.
+  - Reaching it requires two real clicks inside the popup -- "Full
+    Data", then "Download". A one-shot DOM diagnostic
+    (`_debug_dump_view_data_popup()`, still kept below) once found zero
+    buttons immediately after `domcontentloaded`, but that only proved
+    the popup hadn't finished hydrating at that exact instant -- the
+    same class of timing bug this project already hit once before with
+    the login form. `_switch_to_full_data_and_download()` polls for each
+    control instead of checking once, and deliberately does not fall
+    back to clicking Download if "Full Data" can't be found first (that
+    would silently export Summary).
+
+Whichever export actually fires, this project never constructs the
+VizQL command itself -- no `viewDataTableId`, no reconstructed column
+list, no manual POST. `_attach_export_network_diagnostics()` takes an
+optional `_TempfileCapture` and, alongside its existing request/response
+logging, snapshots the first real `.../tempfile/...` response it sees
+via `_capture_tempfile_response()`. `_wait_for_tempfile_capture()` polls
+(no fixed sleep) until that capture is populated or times out.
 `_export_crosstab_csv()` attaches this before the "Data" click (so
-nothing the popup's JS does afterward can be missed), then simply waits
-for it once the popup has opened -- no click inside the popup, no
-command issued, no session discovery. `_save_tempfile_response()`
+nothing the popup's JS does afterward can be missed), drives the two
+clicks above, then waits for the capture. `_save_tempfile_response()`
 (unchanged) validates and saves the captured response's body.
 
 NOT exercised against the real server from this environment: no browser
 binary is installed here (Chromium download is blocked by this sandbox's
 network policy) and network access to insight.erajaya.com is blocked
 too. The DOM selectors below (login, dashboard, Download menu, "Data"
-item) are best-effort, built from accessible roles/names per Tableau's
-general UI conventions, refined against real local runs. If a selector
-doesn't match the live page:
+item, "Full Data" tab, the popup's own Download button) are best-effort,
+built from accessible roles/names per Tableau's general UI conventions,
+refined against real local runs. If a selector doesn't match the live
+page:
   - run with HEADLESS=false to watch it interactively, and
   - check <EXPORT_DIR>/debug_<step>.png, saved automatically on failure,
   - check the [NETDEBUG]-prefixed log lines for export/tempfile network
     activity, and
   - then adjust the candidate locator lists in _login_if_needed() /
-    _wait_for_dashboard() / _export_crosstab_csv() below to match what
-    you see.
+    _wait_for_dashboard() / _export_crosstab_csv() /
+    _switch_to_full_data_and_download() below to match what you see.
 """
 
 from __future__ import annotations
@@ -112,10 +114,39 @@ NETWORK_EXPORT_TIMEOUT_MS = 30_000
 # Used both for diagnostic logging (redacted) and for the tempfile-response
 # wait that replaces Playwright's `download` event -- see
 # "Network-based export" in CLAUDE.md for why.
-EXPORT_COMMAND_URL_SUBSTRING = "export-view-data-summary-to-csv-server"
+#
+# A real HAR capture of the exact manual Full Data flow (see CLAUDE.md,
+# "The Full Data export needs real UI clicks") confirmed the command
+# actually needed is "export-view-data-underlying-to-csv-server" --
+# "export-view-data-summary-to-csv-server" never appears in that HAR at
+# all. The "summary" command is what fires if the popup is left on its
+# default Summary tab; it is deliberately NOT treated as this project's
+# target export.
+EXPORT_COMMAND_URL_SUBSTRING = "export-view-data-underlying-to-csv-server"
 TEMPFILE_URL_SUBSTRING = "/tempfile/"
 
 DOWNLOAD_BUTTON_CANDIDATES = [
+    lambda s: s.get_by_role("button", name=re.compile(r"^download$", re.I)),
+    lambda s: s.locator('[data-tb-test-id="download-Button"]'),
+    lambda s: s.locator('button[aria-label="Download" i]'),
+]
+
+# The "View Data" popup's own UI -- confirmed by the HAR to require two
+# real clicks to reach Full Data (it is not the popup's default tab):
+# switch to "Full Data", then click "Download". An earlier one-shot DOM
+# diagnostic run immediately after domcontentloaded found zero buttons,
+# but that only proves the popup hadn't finished hydrating at that exact
+# instant -- not that it has no DOM (see module docstring). Best-effort,
+# accessible-role-first like every other selector list in this module;
+# not yet confirmed against the live popup's actual markup.
+FULL_DATA_TAB_CANDIDATES = [
+    lambda s: s.get_by_role("tab", name=re.compile(r"^full data$", re.I)),
+    lambda s: s.get_by_role("button", name=re.compile(r"^full data$", re.I)),
+    lambda s: s.get_by_role("menuitem", name=re.compile(r"^full data$", re.I)),
+    lambda s: s.get_by_text(re.compile(r"^full data$", re.I)),
+]
+
+VIEW_DATA_DOWNLOAD_BUTTON_CANDIDATES = [
     lambda s: s.get_by_role("button", name=re.compile(r"^download$", re.I)),
     lambda s: s.locator('[data-tb-test-id="download-Button"]'),
     lambda s: s.locator('button[aria-label="Download" i]'),
@@ -511,9 +542,54 @@ def _export_crosstab_csv(page, export_dir: Path):
     # update changes that. Never touches credentials/cookies/tokens.
     _debug_dump_view_data_popup(view_data_page, export_dir)
 
-    print("Exporting Crosstab...")
+    _switch_to_full_data_and_download(view_data_page, export_dir)
+
     _wait_for_tempfile_capture(view_data_page, tempfile_capture, NETWORK_EXPORT_TIMEOUT_MS)
     return _save_tempfile_response(tempfile_capture.response, export_dir)
+
+
+def _switch_to_full_data_and_download(view_data_page, export_dir: Path) -> None:
+    """Drives the two real UI clicks a HAR capture of the exact manual
+    workflow confirmed are required to get the Full Data export: the
+    popup opens on its default "Summary" tab (which is what
+    export-view-data-summary-to-csv-server would produce, if left
+    alone), so this switches to "Full Data" first, then clicks
+    "Download" -- only then does the popup's own JS fire
+    export-view-data-underlying-to-csv-server (see CLAUDE.md, "The Full
+    Data export needs real UI clicks").
+
+    Polls for each control (no fixed sleep, reusing the existing
+    VIEW_DATA_POPUP_TIMEOUT_MS) instead of checking once -- an earlier
+    one-shot DOM dump ran immediately after domcontentloaded and found
+    zero buttons, which only proves the popup hadn't finished hydrating
+    at that exact instant, not that it has no DOM.
+
+    Deliberately does NOT fall back to clicking Download when "Full
+    Data" can't be found -- that would silently export Summary instead
+    of failing loudly."""
+    print("Waiting for View Data popup to render...")
+    full_data_tab = _find_first_with_wait(view_data_page, FULL_DATA_TAB_CANDIDATES, VIEW_DATA_POPUP_TIMEOUT_MS)
+    if full_data_tab is None:
+        _save_debug_screenshot(view_data_page, export_dir, "full-data-tab-not-found")
+        raise BrowserAutomationError(
+            'Could not find the "Full Data" tab in the View Data window -- refusing to '
+            "click Download without it, since that would export Summary instead."
+        )
+
+    print("Switching to Full Data...")
+    full_data_tab.click()
+
+    download_button = _find_first_with_wait(
+        view_data_page, VIEW_DATA_DOWNLOAD_BUTTON_CANDIDATES, VIEW_DATA_POPUP_TIMEOUT_MS
+    )
+    if download_button is None:
+        _save_debug_screenshot(view_data_page, export_dir, "view-data-download-button-not-found")
+        raise BrowserAutomationError(
+            'Could not find the "Download" button in the View Data window after switching to Full Data.'
+        )
+
+    print("Exporting Full Data...")
+    download_button.click()
 
 
 def _redact_url(url: str) -> str:

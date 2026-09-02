@@ -979,6 +979,99 @@ fix; the fix itself has not yet been run against the real server. The
 next run is what will confirm the capture mechanism saves the file
 end-to-end.
 
+### The Full Data export needs real UI clicks -- wrong endpoint, false "automatic" premise
+
+**A user then ran the tempfile-capture version against the real server,
+requested `python browser_crosstab.py` end-to-end, and reported a run
+that succeeded on its own terms** (login, dashboard, popup, and a real
+`export-view-data-summary-to-csv-server` + `tempfile` pair observed and
+saved) **followed by a user-supplied HAR file, captured from the exact
+manual "Full Data" workflow** (Open dashboard -> Download -> Data -> wait
+for the popup -> click **Full Data** -> click **Download** -> CSV
+produced), with explicit instructions not to assume
+`export-view-data-summary-to-csv-server` was the right target and to
+analyze the HAR as source of truth before changing anything.
+
+**The HAR analysis was conclusive and overturned two assumptions this
+project had been building on:**
+
+1. **Wrong endpoint.** `export-view-data-summary-to-csv-server` never
+   appears anywhere in the Full Data HAR. The command that actually
+   fires is `export-view-data-underlying-to-csv-server` -- a distinct
+   VizQL command, not a variant of the same one. The "automatic" export
+   observed in the previous round (see "The popup already does the whole
+   export automatically" above) was real, but it was the popup's
+   **default Summary tab** firing on its own -- not a Full Data export at
+   all. This project had been correctly capturing the wrong file.
+2. **False "no click needed" premise.** The HAR shows exactly one export
+   in the whole capture, and it only happens after two explicit UI
+   actions inside the popup: clicking the **Full Data** tab (the popup
+   opens on Summary by default), then clicking **Download**. It is not
+   automatic for Full Data -- only Summary fires without user
+   interaction. The earlier "0 visible buttons" DOM diagnostic finding
+   was therefore very likely a timing artifact (checked immediately after
+   `domcontentloaded`, before the popup's SPA UI had hydrated) -- the
+   same root-cause shape as the earlier login-form timing bug -- not
+   proof the popup has no clickable DOM.
+
+**Fix, per explicit instruction to make the minimum correct change and
+not redesign the architecture:**
+
+- `EXPORT_COMMAND_URL_SUBSTRING` changed to
+  `"export-view-data-underlying-to-csv-server"`. `_is_export_related_url()`
+  no longer treats the Summary command as the target export.
+- New locator lists `FULL_DATA_TAB_CANDIDATES` and
+  `VIEW_DATA_DOWNLOAD_BUTTON_CANDIDATES` -- best-effort,
+  accessible-role-first (tab/button/menuitem name "Full Data"; button
+  named "Download"), consistent with every other selector list in this
+  module, not yet confirmed against the live popup's actual markup (no
+  DOM inspection of it was ever possible from this HAR, which is
+  network-only).
+- New `_switch_to_full_data_and_download(view_data_page, export_dir)`
+  drives the two real clicks: polls (via the existing
+  `_find_first_with_wait()`, reusing `VIEW_DATA_POPUP_TIMEOUT_MS`, no
+  fixed sleep) for the Full Data tab, clicks it, then polls for the
+  Download button and clicks it. If the Full Data tab can't be found, it
+  raises `BrowserAutomationError` immediately and deliberately does
+  **not** fall back to clicking Download -- doing so would silently
+  export Summary instead of failing loudly, which is exactly the bug
+  this fix exists to prevent.
+- `_export_crosstab_csv()` now calls this after the existing
+  `_debug_dump_view_data_popup()` diagnostic (kept, unchanged) and before
+  the existing, unchanged `_wait_for_tempfile_capture()` /
+  `_save_tempfile_response()` pair -- the capture mechanism itself needed
+  no changes, since it was already generic (it captures whatever tempfile
+  response appears, regardless of which command produced it); only *what
+  triggers* that response was wrong.
+
+Login, dashboard navigation, the Download-menu and "Data" clicks, popup
+detection, the tempfile-capture mechanism, and the kept DOM diagnostic
+are all unchanged.
+
+Regression tests (`tests/test_browser_crosstab.py`) were updated to
+match: the `ViewDataPopupPage` fake gained the same scripted-locator
+support `ScriptedPage` already had (`script=[...]`, `get_by_role()`/
+`get_by_text()`/`locator()` returning pre-scripted `FakeLocator`s in
+order) so tests can control exactly which candidate matches for each
+click; `test_is_export_related_url_matches_command_and_tempfile_only`
+now asserts the new endpoint substring matches and explicitly asserts
+the old Summary endpoint does **not**; the three `_export_crosstab_csv()`
+end-to-end tests were updated to script both popup clicks before the
+tempfile wait; and new focused tests were added directly against
+`_switch_to_full_data_and_download()`: a `DelayedViewDataPopupPage` fake
+(mirroring the existing `DelayedFieldPage` login-timing regression test)
+proving the Full Data tab is found even when it only appears after a
+couple of poll ticks; the normal find-both-and-click-both path; a case
+proving Download is **never** clicked when the Full Data tab can't be
+found (the explicit anti-Summary-fallback guarantee); and a case where
+Full Data is found but Download is missing. Full suite: 133 passed.
+**Not yet run against the real server** -- the next run is what will
+show whether these locator candidates actually match the live popup's
+Full Data tab and Download button, and whether the resulting CSV is
+genuinely the Full Data export (larger than the previously-captured
+Summary file, matching the HAR's Full Data filename/content
+characteristics).
+
 ## What is tested vs. not
 
 Tested in this environment (`pytest`, no network):
@@ -1041,13 +1134,19 @@ Tested in this environment (`pytest`, no network):
 - `browser_crosstab.py` (module) — `_find_first()`'s fallback matching,
   `_login_if_needed()` (skip/fill/submit/error paths, confirms
   credentials never printed, and the slow-rendering-form regression case),
-  `_wait_for_dashboard()` (success + timeout), `_export_crosstab_csv()`
-  (Download -> Data click sequence, catching the "View Data" popup via a
-  fake `expect_popup()`, the popup-never-opens error path,
-  debug-screenshot-on-failure, the full flow through to a saved CSV by
-  simulating the popup firing a real tempfile network event mid-poll, a
-  never-observed timeout case, and a dedicated secrets-never-printed
-  check), `_capture_tempfile_response()` (stores the first matching
+  `_wait_for_dashboard()` (success + timeout), `_switch_to_full_data_and_download()`
+  (finds and clicks the Full Data tab then the Download button, waits for
+  a slow-hydrating popup UI via a `DelayedViewDataPopupPage` fake
+  mirroring the login-timing regression test, raises without ever
+  clicking Download when Full Data can't be found -- the anti-Summary-
+  fallback guarantee -- and raises when Download is missing after
+  switching), `_export_crosstab_csv()` (Download -> Data click sequence,
+  catching the "View Data" popup via a fake `expect_popup()`, the
+  popup-never-opens error path, debug-screenshot-on-failure, the full
+  flow through both the Full Data/Download popup clicks and on to a saved
+  CSV by simulating the popup firing a real tempfile network event
+  mid-poll, a never-observed timeout case, and a dedicated
+  secrets-never-printed check), `_capture_tempfile_response()` (stores the first matching
   tempfile response as a `_CapturedTempfile` snapshot, ignores the
   export command's own response, keeps only the first match, never
   raises on a broken response object), `_wait_for_tempfile_capture()`
@@ -1088,16 +1187,16 @@ automation" above for exactly why):
   live dashboard's real markup — entirely unverified; they're
   best-effort accessible-role/name guesses, not confirmed by inspection.
 - Whether the login form is detected/filled correctly on the real page.
-- Whether the tempfile-capture approach (see "The popup already does the
-  whole export automatically" above) actually saves the file end to end
-  against the real server: whether `_attach_export_network_diagnostics()`
-  attached before the "Data" click reliably observes the tempfile
-  response on the very next real run (a prior version, since removed,
-  happened to observe it via its own separate diagnostic logger, but
-  that specific code path wasn't the one saving the file), and whether
-  the popup's automatic export behavior is consistent from run to run
-  rather than something that varied by session/timing on the one run
-  observed so far.
+- Whether `FULL_DATA_TAB_CANDIDATES` / `VIEW_DATA_DOWNLOAD_BUTTON_CANDIDATES`
+  (see "The Full Data export needs real UI clicks" above) actually match
+  the live popup's real "Full Data" tab and "Download" button -- entirely
+  unverified; they're best-effort accessible-role/name guesses built from
+  a HAR (network-only, no DOM) rather than confirmed by inspection.
+- Whether the tempfile-capture approach actually saves the file end to
+  end against the real server once triggered by the new Full Data ->
+  Download click sequence, and whether the resulting CSV is genuinely the
+  Full Data export (substantially larger than, and structurally
+  different from, the previously-captured Summary file).
 
 Not tested, requires a machine with access to `insight.erajaya.com`:
 - `discover_api_version()` against the real `serverinfo` endpoint (a user

@@ -28,6 +28,7 @@ from src.exportbot.browser_crosstab import (
     _redact_url,
     _sanitize_filename,
     _save_tempfile_response,
+    _switch_to_full_data_and_download,
     _wait_for_dashboard,
     _wait_for_tempfile_capture,
     generate_export_filename,
@@ -158,19 +159,23 @@ class ScriptedPage(FakeEventPage):
 class ViewDataPopupPage(FakeEventPage):
     """Fake for the "View Data" popup window opened by Download -> Data.
 
-    A real-server run confirmed this popup's own JS runs the entire HAR
-    export sequence automatically -- including the tempfile response
-    that actually delivers the CSV -- entirely on its own, observable
-    only as a "response" network event (see the module docstring in
-    browser_crosstab.py). Its DOM is otherwise empty ("Hybrid Popup
-    Window"), so it is never searched for a Download control or clicked."""
+    A HAR capture of the real manual Full Data workflow showed this
+    popup's UI must actually be clicked through -- "Full Data" then
+    "Download" -- to get the real Full Data export (its default tab is
+    "Summary"); it is not automatic. This fake supports scripted
+    locators (like ScriptedPage) so tests can control exactly which
+    candidate "matches" for each click, plus the same "response" event
+    firing (via FakeEventPage) that carries the resulting tempfile."""
 
     def __init__(
         self,
+        script=None,
         url="https://insight.example.com/vizql/w/ReturnRotate/v/Dashboard1/hybrid-window/min/index.html",
         on_raises=False,
     ):
         super().__init__(on_raises=on_raises)
+        self._script = list(script) if script is not None else []
+        self._pos = 0
         self.frames = []
         self.url = url
         self.wait_for_timeout = MagicMock()
@@ -182,6 +187,25 @@ class ViewDataPopupPage(FakeEventPage):
             return "Hybrid Popup Window"
 
         self.title = _title
+
+    def _next(self, *args, **kwargs):
+        if self._pos >= len(self._script):
+            return FakeLocator(present=False)
+        loc = self._script[self._pos]
+        self._pos += 1
+        return loc
+
+    def get_by_role(self, *args, **kwargs):
+        return self._next()
+
+    def get_by_text(self, *args, **kwargs):
+        return self._next()
+
+    def get_by_label(self, *args, **kwargs):
+        return self._next()
+
+    def locator(self, *args, **kwargs):
+        return self._next()
 
 
 def test_redact_url_redacts_sensitive_params_but_keeps_others():
@@ -666,20 +690,22 @@ def test_attach_export_network_diagnostics_also_registers_tempfile_capture_when_
     assert capture.response.body() == b"a,b\n1,2\n"
 
 
-def test_export_crosstab_csv_full_flow_captures_automatic_tempfile_export(tmp_path):
+def test_export_crosstab_csv_full_flow_switches_to_full_data_then_captures_tempfile(tmp_path):
     """End-to-end through _export_crosstab_csv(): clicking Download ->
-    Data opens the "View Data" popup, and a real-server run confirmed its
-    own JS then completes the ENTIRE export automatically -- the
-    export-view-data-summary-to-csv-server command and the resulting
-    tempfile GET both fire and succeed with no further click, no VizQL
-    session discovery, and no command issued by this project at all (see
-    the module docstring in browser_crosstab.py). This simulates that by
-    firing a "response" network event carrying the real tempfile
-    response while _export_crosstab_csv() is polling for it -- exactly
-    what a real Playwright wait_for_timeout() call would dispatch."""
+    Data opens the "View Data" popup, which opens on its default
+    "Summary" tab. A HAR capture of the real manual workflow showed two
+    further real clicks are required inside that popup -- "Full Data",
+    then "Download" -- before Tableau's own JS fires the
+    export-view-data-underlying-to-csv-server -> tempfile sequence. This
+    simulates the whole chain: both popup clicks happen, then the
+    tempfile response is fired while _export_crosstab_csv() is polling
+    for it -- exactly what a real Playwright wait_for_timeout() call
+    would dispatch."""
     download_btn = FakeLocator()
     data_item = FakeLocator()
-    popup = ViewDataPopupPage()
+    full_data_tab = FakeLocator()
+    view_data_download_btn = FakeLocator()
+    popup = ViewDataPopupPage(script=[full_data_tab, view_data_download_btn])
     page = ScriptedPage(script=[download_btn, data_item], popup=popup)
 
     tempfile_response = FakeAPIResponse(
@@ -695,22 +721,26 @@ def test_export_crosstab_csv_full_flow_captures_automatic_tempfile_export(tmp_pa
 
     download_btn.click.assert_called_once()
     data_item.click.assert_called_once()
+    full_data_tab.click.assert_called_once()
+    view_data_download_btn.click.assert_called_once()
     assert result.parent == tmp_path
     assert result.name.startswith("ReturnRotate_")
     assert result.read_bytes() == b"Product,Region\nWidget,East\n"
 
 
 def test_export_crosstab_csv_raises_when_tempfile_export_never_observed(tmp_path, monkeypatch):
-    """If the popup's own JS never fires the export (e.g. a real
-    behavior change, or a permission/session problem server-side), this
-    must time out into a clear BrowserAutomationError rather than
-    hanging or reporting false success."""
+    """If the popup's own JS never fires the export after both clicks
+    (e.g. a real behavior change, or a permission/session problem
+    server-side), this must time out into a clear BrowserAutomationError
+    rather than hanging or reporting false success."""
     import src.exportbot.browser_crosstab as bc
 
     monkeypatch.setattr(bc, "NETWORK_EXPORT_TIMEOUT_MS", 10)
     download_btn = FakeLocator()
     data_item = FakeLocator()
-    popup = ViewDataPopupPage()
+    full_data_tab = FakeLocator()
+    view_data_download_btn = FakeLocator()
+    popup = ViewDataPopupPage(script=[full_data_tab, view_data_download_btn])
     page = ScriptedPage(script=[download_btn, data_item], popup=popup)
 
     with pytest.raises(BrowserAutomationError, match="Never observed the View Data tempfile response"):
@@ -719,13 +749,15 @@ def test_export_crosstab_csv_raises_when_tempfile_export_never_observed(tmp_path
 
 def test_export_crosstab_csv_never_prints_secrets_around_tempfile_capture(tmp_path, capsys):
     """The [NETDEBUG] lines fired by the diagnostic logger while waiting
-    for the automatic export must never print the real session id or
-    result key -- only _redact_url()-redacted URLs. This is what would
-    have caught the real leak found earlier this session (the session id
-    sits in the URL PATH, which _redact_url() did not originally strip)."""
+    for the export must never print the real session id or result key --
+    only _redact_url()-redacted URLs. This is what would have caught the
+    real leak found earlier this session (the session id sits in the URL
+    PATH, which _redact_url() did not originally strip)."""
     download_btn = FakeLocator()
     data_item = FakeLocator()
-    popup = ViewDataPopupPage()
+    full_data_tab = FakeLocator()
+    view_data_download_btn = FakeLocator()
+    popup = ViewDataPopupPage(script=[full_data_tab, view_data_download_btn])
     page = ScriptedPage(script=[download_btn, data_item], popup=popup)
 
     class FakeRequest:
@@ -750,14 +782,119 @@ def test_export_crosstab_csv_never_prints_secrets_around_tempfile_capture(tmp_pa
     assert "KEY123" not in out
 
 
+class DelayedViewDataPopupPage:
+    """Simulates the View Data popup's "Full Data" tab only appearing in
+    the DOM after a couple of polling ticks -- mirrors the real,
+    previously-fixed login-form timing bug (DelayedFieldPage above): a
+    one-shot check right after domcontentloaded can false-negative on a
+    popup whose SPA UI hasn't hydrated yet, which is exactly why
+    _switch_to_full_data_and_download() must poll rather than check
+    once."""
+
+    def __init__(self, appears_after_ticks=2):
+        self._ticks = 0
+        self._appears_after = appears_after_ticks
+        self.frames = []
+        self.full_data_tab = FakeLocator()
+        self.download_button = FakeLocator()
+        self.wait_for_timeout = MagicMock(side_effect=self._tick)
+        self.screenshot = MagicMock()
+
+    def _tick(self, *args, **kwargs):
+        self._ticks += 1
+
+    def _ready(self):
+        return self._ticks >= self._appears_after
+
+    def get_by_role(self, role, name=None, **kwargs):
+        if not self._ready() or name is None:
+            return FakeLocator(present=False)
+        text = name.pattern.lower() if hasattr(name, "pattern") else str(name).lower()
+        if role == "tab" and "full data" in text:
+            return self.full_data_tab
+        if role == "button" and "download" in text:
+            return self.download_button
+        return FakeLocator(present=False)
+
+    def get_by_text(self, *args, **kwargs):
+        return FakeLocator(present=False)
+
+    def locator(self, *args, **kwargs):
+        return FakeLocator(present=False)
+
+
+def test_switch_to_full_data_and_download_waits_for_slow_rendering_popup_ui(tmp_path):
+    """The real-server "0 visible buttons" DOM diagnostic was a one-shot
+    check taken immediately after domcontentloaded -- not proof the
+    popup has no DOM, only that it hadn't hydrated yet at that exact
+    instant (the same bug class as the login-form timing bug). This
+    reproduces that shape: the Full Data tab only becomes findable after
+    a couple of poll ticks."""
+    popup = DelayedViewDataPopupPage(appears_after_ticks=2)
+
+    _switch_to_full_data_and_download(popup, tmp_path)
+
+    popup.full_data_tab.click.assert_called_once()
+    popup.download_button.click.assert_called_once()
+
+
+def test_switch_to_full_data_and_download_clicks_full_data_then_download(tmp_path):
+    """Direct unit test of the click sequence: Full Data must be found
+    and clicked, then Download found and clicked, in that order."""
+    full_data_tab = FakeLocator()
+    download_button = FakeLocator()
+    popup = ViewDataPopupPage(script=[full_data_tab, download_button])
+
+    _switch_to_full_data_and_download(popup, tmp_path)
+
+    full_data_tab.click.assert_called_once()
+    download_button.click.assert_called_once()
+
+
+def test_switch_to_full_data_and_download_never_clicks_download_when_full_data_missing(tmp_path, monkeypatch):
+    """Rejects/avoids the Summary export: if the "Full Data" tab can't be
+    found, Download must never be clicked -- clicking it in that state
+    would silently export Summary instead of failing loudly."""
+    import src.exportbot.browser_crosstab as bc
+
+    monkeypatch.setattr(bc, "VIEW_DATA_POPUP_TIMEOUT_MS", 10)
+    download_button = FakeLocator()
+    # Full Data tab never present (empty script); Download is scripted but
+    # must never actually be reached/clicked.
+    popup = ViewDataPopupPage(script=[])
+
+    with pytest.raises(BrowserAutomationError, match='"Full Data" tab'):
+        _switch_to_full_data_and_download(popup, tmp_path)
+
+    download_button.click.assert_not_called()
+
+
+def test_switch_to_full_data_and_download_raises_when_download_button_missing(tmp_path, monkeypatch):
+    import src.exportbot.browser_crosstab as bc
+
+    monkeypatch.setattr(bc, "VIEW_DATA_POPUP_TIMEOUT_MS", 10)
+    full_data_tab = FakeLocator()
+    popup = ViewDataPopupPage(script=[full_data_tab])  # Download never present
+
+    with pytest.raises(BrowserAutomationError, match='"Download" button'):
+        _switch_to_full_data_and_download(popup, tmp_path)
+
+    full_data_tab.click.assert_called_once()
+
+
 def test_is_export_related_url_matches_command_and_tempfile_only():
     assert _is_export_related_url(
-        "https://insight.example.com/vizql/w/x/v/y/sessions/1/commands/tabsrv/export-view-data-summary-to-csv-server"
+        "https://insight.example.com/vizql/w/x/v/y/sessions/1/commands/tabsrv/export-view-data-underlying-to-csv-server"
     )
     assert _is_export_related_url(
         "https://insight.example.com/vizql/w/x/v/y/tempfile/sessions/1?key=abc"
     )
     assert not _is_export_related_url("https://insight.example.com/vizql/w/x/v/y/commands/tabdoc/launch-hybrid-view-data-dialog")
+    # The HAR-confirmed Summary command must NOT be treated as the target
+    # export -- getting it means the popup was left on its default tab.
+    assert not _is_export_related_url(
+        "https://insight.example.com/vizql/w/x/v/y/sessions/1/commands/tabsrv/export-view-data-summary-to-csv-server"
+    )
 
 
 def test_extract_filename_from_content_disposition_plain():
