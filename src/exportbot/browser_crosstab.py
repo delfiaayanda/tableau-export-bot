@@ -111,6 +111,12 @@ SENSITIVE_URL_PARAM_NAMES = {
     "csrf",
 }
 
+# Every VizQL command/tempfile URL this module builds carries the session
+# id as a PATH segment (".../sessions/{id}/..."), not a query parameter --
+# SENSITIVE_URL_PARAM_NAMES above only covers the query string, so this
+# catches the path form too before a URL is ever printed.
+SESSION_PATH_SEGMENT_RE = re.compile(r"(/sessions/)[^/?]+")
+
 DASHBOARD_URL = "https://insight.erajaya.com/#/views/ReturnRotate/Dashboard1?:id=1"
 EXPORT_FILENAME_PREFIX = "ReturnRotate"
 
@@ -492,9 +498,13 @@ def _redact_url(url: str) -> str:
     """Redacts query parameter VALUES whose name looks session/auth/token
     related (see SENSITIVE_URL_PARAM_NAMES), so a URL is safe to print
     even though it may embed Tableau's own internal session/ticket
-    identifiers (as seen in the "View Data" popup's own URL). Never
-    touches the scheme/host/path, and never raises -- an unparseable URL
-    is reported as such rather than printed raw."""
+    identifiers (as seen in the "View Data" popup's own URL). Also
+    redacts the path segment immediately following "/sessions/" -- every
+    VizQL command and tempfile URL this module builds itself carries the
+    session id there, in the PATH, not as a query parameter, so it would
+    otherwise leak straight through the [NETDEBUG] logs untouched. Never
+    touches the scheme/host or any other path segment, and never raises
+    -- an unparseable URL is reported as such rather than printed raw."""
     try:
         parts = urlsplit(url)
         redacted_params = [
@@ -502,7 +512,8 @@ def _redact_url(url: str) -> str:
             for name, value in parse_qsl(parts.query, keep_blank_values=True)
         ]
         redacted_query = urlencode(redacted_params)
-        return urlunsplit((parts.scheme, parts.netloc, parts.path, redacted_query, parts.fragment))
+        redacted_path = SESSION_PATH_SEGMENT_RE.sub(r"\1REDACTED", parts.path)
+        return urlunsplit((parts.scheme, parts.netloc, redacted_path, redacted_query, parts.fragment))
     except Exception:
         return "[unparseable URL]"
 

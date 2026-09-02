@@ -67,12 +67,15 @@ class FakeAPIResponse:
     `page.context.request.post()` call (consumed directly by
     _export_view_data_via_vizql_commands())."""
 
-    def __init__(self, url, status=200, headers=None, body=b"Product,Region\nWidget,East\n", json_body=None):
+    def __init__(
+        self, url, status=200, headers=None, body=b"Product,Region\nWidget,East\n", json_body=None, text_body=None
+    ):
         self.url = url
         self.status = status
         self.headers = headers if headers is not None else {"content-type": "text/csv"}
         self._body = body
         self._json_body = json_body
+        self._text_body = text_body
 
     @property
     def ok(self):
@@ -85,6 +88,13 @@ class FakeAPIResponse:
         if self._json_body is None:
             raise ValueError("no JSON body configured on this fake response")
         return self._json_body
+
+    def text(self):
+        if self._text_body is not None:
+            return self._text_body
+        if self._json_body is not None:
+            return json.dumps(self._json_body)
+        return ""
 
 
 class FakeAPIRequestContext:
@@ -254,6 +264,34 @@ def test_redact_url_redacts_sensitive_params_but_keeps_others():
 
 def test_redact_url_never_raises_on_unparseable_input():
     assert _redact_url(object()) == "[unparseable URL]"
+
+
+def test_redact_url_redacts_session_id_in_path():
+    """Every VizQL command/tempfile URL this module builds carries the
+    session id as a PATH segment (.../sessions/{id}/...), not a query
+    parameter -- this must be redacted too, or it leaks straight through
+    the [NETDEBUG] logs printed around the export/tempfile requests."""
+    url = (
+        "https://insight.example.com/vizql/w/ReturnRotate/v/Dashboard1"
+        "/sessions/SUPERSECRETSESSIONID/commands/tabsrv/export-view-data-summary-to-csv-server"
+    )
+    redacted = _redact_url(url)
+    assert "SUPERSECRETSESSIONID" not in redacted
+    assert "/sessions/REDACTED/" in redacted
+    assert redacted.startswith("https://insight.example.com/vizql/w/ReturnRotate/v/Dashboard1")
+
+
+def test_redact_url_redacts_session_id_in_path_and_key_in_query_together():
+    url = (
+        "https://insight.example.com/vizql/w/ReturnRotate/v/Dashboard1"
+        "/tempfile/sessions/SUPERSECRETSESSIONID?key=THERESULTKEY&keepfile=yes"
+    )
+    redacted = _redact_url(url)
+    assert "SUPERSECRETSESSIONID" not in redacted
+    assert "THERESULTKEY" not in redacted
+    assert "/sessions/REDACTED" in redacted
+    assert "key=REDACTED" in redacted
+    assert "keepfile=yes" in redacted
 
 
 class FakeFrame:
@@ -743,6 +781,16 @@ def test_find_vizql_session_in_resource_urls_returns_none_when_no_match():
     assert _find_vizql_session_in_resource_urls([]) is None
 
 
+def test_find_vizql_session_in_resource_urls_skips_malformed_entries_without_raising():
+    """performance.getEntriesByType("resource") entries are just strings
+    in practice, but this must not assume that -- a non-string/None entry
+    (or one VIZQL_SESSION_ID_RE can't run against) must be skipped, not
+    raise, so one bad entry can't break discovery for every other URL in
+    the list."""
+    result = _find_vizql_session_in_resource_urls([None, 12345, object(), BOOTSTRAP_RESOURCE_URL])
+    assert result == (SESSION_ORIGIN, SESSION_PATH_PREFIX, SESSION_ID)
+
+
 def test_find_xsrf_token_in_cookies_matches_known_cookie_names():
     context = FakeBrowserContext(cookies=[{"name": "XSRF-TOKEN", "value": "the-real-token"}])
     assert _find_xsrf_token_in_cookies(context) == "the-real-token"
@@ -759,6 +807,15 @@ def test_find_xsrf_token_in_cookies_never_raises_when_cookies_fails():
             raise RuntimeError("boom")
 
     assert _find_xsrf_token_in_cookies(BrokenContext()) is None
+
+
+def test_find_xsrf_token_in_cookies_skips_malformed_cookie_entries():
+    """A cookie entry that isn't a plain {"name": ..., "value": ...} dict
+    (e.g. missing .get() entirely) must be skipped, not raise -- one
+    malformed cookie can't be allowed to hide a real XSRF cookie later
+    in the list."""
+    context = FakeBrowserContext(cookies=[object(), {"name": "XSRF-TOKEN", "value": "the-real-token"}])
+    assert _find_xsrf_token_in_cookies(context) == "the-real-token"
 
 
 def test_discover_active_vizql_session_finds_session_on_second_page():
@@ -842,6 +899,20 @@ def test_fetch_view_data_dialog_tab_pres_model_raises_on_non_ok_status():
         _fetch_view_data_dialog_tab_pres_model(request_ctx, capture)
 
 
+def test_fetch_view_data_dialog_tab_pres_model_error_includes_response_body_snippet():
+    """A real failure must be diagnosable from the raised error's text
+    alone, per the explicit "diagnose the actual HTTP response/status/
+    body" requirement -- not just a bare status code."""
+    capture = _make_completed_capture()
+    response = FakeAPIResponse(
+        url=TAB_PRES_MODEL_URL, status=403, text_body="Forbidden: session has expired"
+    )
+    request_ctx = FakeAPIRequestContext(post_responses=[response])
+
+    with pytest.raises(BrowserAutomationError, match="session has expired"):
+        _fetch_view_data_dialog_tab_pres_model(request_ctx, capture)
+
+
 def test_fetch_view_data_dialog_tab_pres_model_raises_when_visual_id_pres_model_missing():
     capture = _make_completed_capture(visual_id_pres_model=None)
     response = FakeAPIResponse(url=TAB_PRES_MODEL_URL, json_body={"nothing": "here"})
@@ -849,6 +920,23 @@ def test_fetch_view_data_dialog_tab_pres_model_raises_when_visual_id_pres_model_
 
     with pytest.raises(BrowserAutomationError, match="no visualIdPresModel was found"):
         _fetch_view_data_dialog_tab_pres_model(request_ctx, capture)
+
+
+def test_fetch_view_data_dialog_tab_pres_model_ignores_non_string_list_columns():
+    """`columns` must only be accepted when it's actually a list of
+    strings -- a malformed shape (e.g. a list of numbers, or a bare
+    string) must be left as None, not blindly stored and later sent to
+    Tableau's export command."""
+    capture = _make_completed_capture(visual_id_pres_model=None, columns=None)
+    response = FakeAPIResponse(
+        url=TAB_PRES_MODEL_URL, json_body={"visualIdPresModel": "visual-abc", "columns": [1, 2, 3]}
+    )
+    request_ctx = FakeAPIRequestContext(post_responses=[response])
+
+    _fetch_view_data_dialog_tab_pres_model(request_ctx, capture)
+
+    assert capture.visual_id_pres_model == "visual-abc"
+    assert capture.columns is None
 
 
 def test_export_view_data_via_vizql_commands_success(tmp_path):
@@ -904,6 +992,22 @@ def test_export_view_data_via_vizql_commands_raises_on_non_ok_status(tmp_path):
         _export_view_data_via_vizql_commands(page, popup, capture, tmp_path)
 
 
+def test_export_view_data_via_vizql_commands_error_includes_response_body_snippet(tmp_path):
+    """Same "diagnosable from the error alone" requirement as the
+    tab-pres-model command -- the export command's own failure text must
+    carry the real response body, not just a status code."""
+    capture = _make_completed_capture()
+    export_response = FakeAPIResponse(
+        url=EXPORT_COMMAND_URL, status=400, text_body="Bad Request: invalid columns"
+    )
+    request_ctx = FakeAPIRequestContext(post_responses=[_make_tab_pres_model_response(), export_response])
+    page = ScriptedPage(script=[], context=FakeBrowserContext(request_context=request_ctx))
+    popup = ViewDataPopupPage()
+
+    with pytest.raises(BrowserAutomationError, match="invalid columns"):
+        _export_view_data_via_vizql_commands(page, popup, capture, tmp_path)
+
+
 def test_export_view_data_via_vizql_commands_raises_when_result_key_missing(tmp_path):
     capture = _make_completed_capture()
     export_response = FakeAPIResponse(url=EXPORT_COMMAND_URL, json_body={"nothing": "here"})
@@ -927,6 +1031,38 @@ def test_export_view_data_via_vizql_commands_raises_when_tempfile_fetch_fails(tm
 
     with pytest.raises(BrowserAutomationError, match="Could not fetch the exported tempfile"):
         _export_view_data_via_vizql_commands(page, popup, capture, tmp_path)
+
+
+def test_export_view_data_via_vizql_commands_never_prints_secrets(tmp_path, capsys):
+    """The [NETDEBUG] status lines printed around session discovery, the
+    tab presentation model fetch, the export command, and the tempfile
+    GET must never print the actual session id, XSRF token,
+    visualIdPresModel, or result key -- only booleans and
+    _redact_url()-redacted URLs. This is what actually caught a real
+    leak: the export/tempfile URLs carry the session id as a PATH
+    segment, which _redact_url() did not originally strip (it only
+    covered query parameters) -- fixed there, verified here end to end
+    rather than by asserting _redact_url() in isolation."""
+    capture = _make_completed_capture()
+    export_response = FakeAPIResponse(
+        url=EXPORT_COMMAND_URL, json_body={"resultKey": "THE-SECRET-RESULT-KEY"}
+    )
+    tempfile_response = FakeAPIResponse(
+        url=TEMPFILE_URL, headers={"content-type": "text/csv"}, body=b"a,b\n1,2\n"
+    )
+    request_ctx = FakeAPIRequestContext(
+        post_responses=[_make_tab_pres_model_response(), export_response], get_response=tempfile_response
+    )
+    page = ScriptedPage(script=[], context=FakeBrowserContext(request_context=request_ctx))
+    popup = ViewDataPopupPage()
+
+    _export_view_data_via_vizql_commands(page, popup, capture, tmp_path)
+
+    out = capsys.readouterr().out
+    assert capture.session_id not in out
+    assert capture.xsrf_token not in out
+    assert capture.visual_id_pres_model not in out
+    assert "THE-SECRET-RESULT-KEY" not in out
 
 
 def test_is_export_related_url_matches_command_and_tempfile_only():
