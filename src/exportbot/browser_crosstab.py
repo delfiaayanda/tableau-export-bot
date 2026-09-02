@@ -166,6 +166,7 @@ import os
 import re
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
@@ -309,8 +310,6 @@ SIGN_IN_BUTTON_CANDIDATES = [
 ]
 
 def generate_export_filename(now=None) -> str:
-    from datetime import datetime
-
     now = now or datetime.now()
     return f"{EXPORT_FILENAME_PREFIX}_{now:%Y%m%d_%H%M%S}.csv"
 
@@ -821,12 +820,20 @@ def _sanitize_filename(name: str | None) -> str | None:
     return base or None
 
 
-def _save_tempfile_response(response, export_dir: Path, download=None) -> Path:
-    """Saves the exported CSV to EXPORT_DIR. Verifies the captured
-    `.../tempfile/...` response's Content-Type looks like the expected
-    CSV/text export and its status isn't an error before writing
-    anything, since this is meant to replace Playwright's `download`
-    event as the success signal, not blindly trust any matching URL.
+def _save_tempfile_response(response, export_dir: Path, download=None, now=None) -> Path:
+    """Saves the exported CSV to `<export_dir>/<YYYY-MM-DD>/<filename>` --
+    the same date-folder convention `exporter.py` already uses for the
+    REST pipeline's Excel output. Tableau's own Content-Disposition
+    filename is static (e.g. "Persentase Nasional_Full Data_data.csv",
+    no date), so without this a daily scheduled run would overwrite the
+    previous day's export instead of keeping one file per day. `now` is
+    injectable for deterministic tests.
+
+    Verifies the captured `.../tempfile/...` response's Content-Type
+    looks like the expected CSV/text export and its status isn't an
+    error before writing anything, since this is meant to replace
+    Playwright's `download` event as the success signal, not blindly
+    trust any matching URL.
 
     Bytes come from `download.path()` when a `Download` was captured
     (see _capture_download()) -- the reliable source once Chrome's own
@@ -891,8 +898,10 @@ def _save_tempfile_response(response, export_dir: Path, download=None) -> Path:
         if suggested and os.path.splitext(suggested)[1].lower() in (".csv", ".txt"):
             filename = suggested
 
-    export_dir.mkdir(parents=True, exist_ok=True)
-    target_path = export_dir / (filename or generate_export_filename())
+    now = now or datetime.now()
+    day_folder = export_dir / now.strftime("%Y-%m-%d")
+    day_folder.mkdir(parents=True, exist_ok=True)
+    target_path = day_folder / (filename or generate_export_filename(now))
     target_path.write_bytes(body)
     return target_path
 

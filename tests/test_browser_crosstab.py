@@ -929,7 +929,7 @@ def test_export_crosstab_csv_full_flow_switches_to_full_data_then_captures_tempf
     data_item.click.assert_called_once()
     full_data_tab.click.assert_called_once()
     view_data_download_btn.click.assert_called_once()
-    assert result.parent == tmp_path
+    assert result.parent == tmp_path / datetime.now().strftime("%Y-%m-%d")
     assert result.name.startswith("ReturnRotate_")
     assert result.read_bytes() == b"Product,Region\nWidget,East\n"
 
@@ -1191,9 +1191,25 @@ def test_save_tempfile_response_uses_content_disposition_filename(tmp_path):
         headers={"content-type": "text/csv", "content-disposition": 'attachment; filename="Persentase Nasional_data.csv"'},
         body=b"a,b\n1,2\n",
     )
-    path = _save_tempfile_response(response, tmp_path)
-    assert path == tmp_path / "Persentase Nasional_data.csv"
+    path = _save_tempfile_response(response, tmp_path, now=datetime(2026, 9, 1, 14, 30, 45))
+    assert path == tmp_path / "2026-09-01" / "Persentase Nasional_data.csv"
     assert path.read_bytes() == b"a,b\n1,2\n"
+
+
+def test_save_tempfile_response_saves_into_a_date_folder_matching_exporter_convention(tmp_path):
+    """Tableau's own Content-Disposition filename is static (no date), so
+    without a date folder a daily scheduled run would overwrite the
+    previous day's export instead of keeping one file per day -- see
+    exporter.py's identical <export_dir>/<YYYY-MM-DD>/ convention for the
+    REST pipeline."""
+    response = FakeAPIResponse(
+        url="https://insight.example.com/vizql/tempfile/sessions/1?key=abc",
+        headers={"content-type": "text/csv"},
+        body=b"a,b\n1,2\n",
+    )
+    path = _save_tempfile_response(response, tmp_path, now=datetime(2026, 9, 2, 8, 0, 0))
+    assert path.parent.name == "2026-09-02"
+    assert path.parent.parent == tmp_path
 
 
 def test_save_tempfile_response_falls_back_to_generated_filename_without_disposition(tmp_path):
@@ -1201,8 +1217,8 @@ def test_save_tempfile_response_falls_back_to_generated_filename_without_disposi
         url="https://insight.example.com/vizql/tempfile/sessions/1?key=abc",
         headers={"content-type": "text/csv"},
     )
-    path = _save_tempfile_response(response, tmp_path)
-    assert path.parent == tmp_path
+    path = _save_tempfile_response(response, tmp_path, now=datetime(2026, 9, 1, 14, 30, 45))
+    assert path.parent == tmp_path / "2026-09-01"
     assert path.name.startswith("ReturnRotate_")
     assert path.name.endswith(".csv")
 

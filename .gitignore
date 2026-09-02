@@ -217,5 +217,8 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
+# Daily scheduled-run logs (run_daily_export.bat)
+logs/
+
 # Project exports (generated output, date-stamped)
 /exports/
