@@ -17,23 +17,24 @@ import pytest
 from src.exportbot.browser_crosstab import (
     _ViewDataSessionCapture,
     _attach_export_network_diagnostics,
-    _attach_vizql_bootstrap_listeners,
-    _capture_bootstrap_request,
-    _capture_bootstrap_response,
     _debug_dump_view_data_popup,
+    _discover_active_vizql_session,
     _export_crosstab_csv,
     _export_view_data_via_vizql_commands,
     _extract_filename_from_content_disposition,
+    _fetch_view_data_dialog_tab_pres_model,
     _find_first,
     _find_key_recursive,
+    _find_vizql_session_in_resource_urls,
+    _find_xsrf_token_in_cookies,
     _inspect_frame,
     _is_export_related_url,
     _login_if_needed,
     _redact_url,
+    _safe_response_text_snippet,
     _sanitize_filename,
     _save_tempfile_response,
     _wait_for_dashboard,
-    _wait_for_view_data_session_capture,
     generate_export_filename,
     resolve_executable_path,
     resolve_headless,
@@ -86,29 +87,18 @@ class FakeAPIResponse:
         return self._json_body
 
 
-class FakeRequest:
-    """Fake for a Playwright Request -- only the pieces
-    _capture_bootstrap_request() reads: .url and the X-XSRF-TOKEN header
-    via .header_value()."""
-
-    def __init__(self, url, headers=None):
-        self.url = url
-        self._headers = {k.lower(): v for k, v in (headers or {}).items()}
-
-    def header_value(self, name):
-        return self._headers.get(name.lower())
-
-
 class FakeAPIRequestContext:
     """Fake for Playwright's APIRequestContext (page.context.request) --
     records every .post()/.get() call (url/headers/multipart/params) for
-    assertions, and returns pre-scripted responses or raises a scripted
-    exception."""
+    assertions, and returns pre-scripted responses (consumed in call
+    order for .post(), since production code now issues two POSTs --
+    get-view-data-dialog-tab-pres-model, then the export command) or
+    raises a scripted exception."""
 
-    def __init__(self, post_response=None, get_response=None, post_raises=None, get_raises=None):
+    def __init__(self, post_responses=None, get_response=None, post_raises=None, get_raises=None):
         self.post_calls = []
         self.get_calls = []
-        self._post_response = post_response
+        self._post_responses = list(post_responses) if post_responses is not None else []
         self._get_response = get_response
         self._post_raises = post_raises
         self._get_raises = get_raises
@@ -117,7 +107,9 @@ class FakeAPIRequestContext:
         self.post_calls.append({"url": url, "headers": headers, "multipart": multipart})
         if self._post_raises is not None:
             raise self._post_raises
-        return self._post_response
+        if self._post_responses:
+            return self._post_responses.pop(0)
+        return None
 
     def get(self, url, params=None, timeout=None):
         self.get_calls.append({"url": url, "params": params})
@@ -128,28 +120,22 @@ class FakeAPIRequestContext:
 
 class FakeBrowserContext:
     """Fake for a Playwright BrowserContext -- exposes `.request` (a
-    FakeAPIRequestContext) and `.on()`. Registering a "request"/"response"
-    handler immediately replays `bootstrap_request`/`bootstrap_response`
-    into it if configured, simulating Tableau's own VizQL bootstrap
-    commands having already fired by the time
-    _attach_vizql_bootstrap_listeners() (called right before the "Data"
-    click, per the module's real ordering requirement) is invoked --
-    exactly the scenario the real HAR shows (the click is itself what
-    fires them)."""
+    FakeAPIRequestContext), `.cookies()` (a fixed list of cookie dicts,
+    standing in for the browser's real cookie jar -- see
+    _find_xsrf_token_in_cookies()), and `.on()` (used only by the
+    unrelated, still-kept _attach_export_network_diagnostics)."""
 
-    def __init__(self, request_context=None, bootstrap_request=None, bootstrap_response=None, on_raises=False):
+    def __init__(self, request_context=None, cookies=None, on_raises=False):
         self.request = request_context if request_context is not None else FakeAPIRequestContext()
-        self._bootstrap_request = bootstrap_request
-        self._bootstrap_response = bootstrap_response
+        self._cookies = cookies if cookies is not None else []
         self._on_raises = on_raises
+
+    def cookies(self):
+        return self._cookies
 
     def on(self, event, handler):
         if self._on_raises:
             raise RuntimeError("on() failed")
-        if event == "request" and self._bootstrap_request is not None:
-            handler(self._bootstrap_request)
-        elif event == "response" and self._bootstrap_response is not None:
-            handler(self._bootstrap_response)
 
 
 class _PopupCM:
@@ -180,7 +166,7 @@ class ScriptedPage:
     which candidate in an ordered fallback list "matches" without
     simulating real DOM text matching."""
 
-    def __init__(self, script, popup=None, context=None):
+    def __init__(self, script, popup=None, context=None, resource_urls=None):
         self._script = list(script)
         self._pos = 0
         self.frames = []
@@ -191,6 +177,7 @@ class ScriptedPage:
         self.screenshot = MagicMock()
         self.on = MagicMock()
         self.context = context if context is not None else FakeBrowserContext()
+        self._resource_urls = resource_urls if resource_urls is not None else []
 
     def _next(self, *args, **kwargs):
         if self._pos >= len(self._script):
@@ -214,30 +201,42 @@ class ScriptedPage:
     def expect_popup(self, timeout=None):
         return _PopupCM(self._popup)
 
+    def evaluate(self, script):
+        return self._resource_urls
+
 
 class ViewDataPopupPage:
     """Fake for the "View Data" popup window opened by Download -> Data.
 
     A real-server diagnostic showed this popup's own DOM is entirely
     empty (a "Hybrid Popup Window" wrapper) -- see the module docstring
-    in browser_crosstab.py. Its only remaining role is as the polling
-    driver for _wait_for_view_data_session_capture() (.wait_for_timeout)
-    and the target of the still-kept _debug_dump_view_data_popup(); it is
-    never searched for a Download control or clicked any more."""
+    in browser_crosstab.py. Its remaining roles are: the polling driver
+    for _discover_active_vizql_session() (.wait_for_timeout), a second
+    source of Performance Resource Timing URLs for that same discovery
+    (.evaluate), and the target of the still-kept
+    _debug_dump_view_data_popup(); it is never searched for a Download
+    control or clicked any more."""
 
-    def __init__(self, url="https://insight.example.com/vizql/w/ReturnRotate/v/Dashboard1/hybrid-window/min/index.html"):
+    def __init__(
+        self,
+        url="https://insight.example.com/vizql/w/ReturnRotate/v/Dashboard1/hybrid-window/min/index.html",
+        resource_urls=None,
+    ):
         self.frames = []
         self.url = url
         self.wait_for_timeout = MagicMock()
         self.wait_for_load_state = MagicMock()
         self.goto = MagicMock()
         self.screenshot = MagicMock()
+        self._resource_urls = resource_urls if resource_urls is not None else []
 
         def _title():
             return "Hybrid Popup Window"
 
         self.title = _title
-        self.evaluate = MagicMock(return_value=[])
+
+    def evaluate(self, script):
+        return self._resource_urls
 
 
 def test_redact_url_redacts_sensitive_params_but_keeps_others():
@@ -585,70 +584,86 @@ def test_wait_for_dashboard_raises_on_timeout(monkeypatch):
         _wait_for_dashboard(page)
 
 
-BOOTSTRAP_URL = (
-    "https://insight.example.com/vizql/w/ReturnRotate/v/Dashboard1"
-    "/sessions/SESSIONABC/commands/tabdoc/launch-hybrid-view-data-dialog"
+SESSION_ORIGIN = "https://insight.example.com"
+SESSION_PATH_PREFIX = "w/ReturnRotate/v/Dashboard1"
+SESSION_ID = "SESSIONABC"
+BOOTSTRAP_RESOURCE_URL = (
+    f"{SESSION_ORIGIN}/vizql/{SESSION_PATH_PREFIX}/sessions/{SESSION_ID}"
+    "/commands/tabdoc/launch-hybrid-view-data-dialog"
+)
+TAB_PRES_MODEL_URL = (
+    f"{SESSION_ORIGIN}/vizql/{SESSION_PATH_PREFIX}/sessions/{SESSION_ID}"
+    "/commands/tabsrv/get-view-data-dialog-tab-pres-model"
 )
 EXPORT_COMMAND_URL = (
-    "https://insight.example.com/vizql/w/ReturnRotate/v/Dashboard1"
-    "/sessions/SESSIONABC/commands/tabsrv/export-view-data-summary-to-csv-server"
+    f"{SESSION_ORIGIN}/vizql/{SESSION_PATH_PREFIX}/sessions/{SESSION_ID}"
+    "/commands/tabsrv/export-view-data-summary-to-csv-server"
 )
-TEMPFILE_URL = "https://insight.example.com/vizql/w/ReturnRotate/v/Dashboard1/tempfile/sessions/SESSIONABC"
+TEMPFILE_URL = f"{SESSION_ORIGIN}/vizql/{SESSION_PATH_PREFIX}/tempfile/sessions/{SESSION_ID}"
 
 
 def _make_completed_capture(**overrides):
     capture = _ViewDataSessionCapture()
-    capture.origin = "https://insight.example.com"
-    capture.command_path_prefix = "w/ReturnRotate/v/Dashboard1"
-    capture.session_id = "SESSIONABC"
-    capture.visual_id_pres_model = "visual-abc"
+    capture.origin = SESSION_ORIGIN
+    capture.command_path_prefix = SESSION_PATH_PREFIX
+    capture.session_id = SESSION_ID
     capture.xsrf_token = "xsrf-value-123"
+    capture.visual_id_pres_model = "visual-abc"
     capture.columns = ["Product", "Region"]
     for key, value in overrides.items():
         setattr(capture, key, value)
     return capture
 
 
+def _make_tab_pres_model_response():
+    return FakeAPIResponse(
+        url=TAB_PRES_MODEL_URL,
+        json_body={"visualIdPresModel": "visual-abc", "columns": ["Product", "Region"]},
+    )
+
+
 def test_export_crosstab_csv_full_flow_reproduces_vizql_export_commands(tmp_path):
     """End-to-end through _export_crosstab_csv(): clicking Download ->
     Data opens the "View Data" popup (kept, confirmed working against
     the real server), but the CSV export itself is now reproduced by
-    issuing Tableau's own VizQL commands directly -- see the module
-    docstring in browser_crosstab.py for why every DOM-based approach
-    (the popup's own empty DOM, the main dashboard's Download button
-    blocked by Tableau's own dialog-glass overlay) was ruled out.
-
-    `capture` is passed in already complete, matching production: it's
-    now populated by listeners attached in run_browser_crosstab_export()
-    right after the dashboard navigation, not by _export_crosstab_csv()
-    itself -- see test_run_browser_crosstab_export_attaches_vizql_bootstrap_listeners_before_wait_for_dashboard
-    for that earlier-attachment behavior."""
+    discovering the already-active VizQL session from browser state
+    (Performance Resource Timing entries + cookies) and issuing
+    Tableau's own VizQL commands directly -- see the module docstring in
+    browser_crosstab.py for why every DOM-based approach (the popup's
+    own empty DOM, the main dashboard's Download button blocked by
+    Tableau's own dialog-glass overlay) and every listener-based capture
+    approach were ruled out."""
     download_btn = FakeLocator()
     data_item = FakeLocator()
-    popup = ViewDataPopupPage()
-    capture = _make_completed_capture()
+    popup = ViewDataPopupPage(resource_urls=[BOOTSTRAP_RESOURCE_URL])
 
+    tab_pres_model_response = _make_tab_pres_model_response()
     export_response = FakeAPIResponse(url=EXPORT_COMMAND_URL, json_body={"resultKey": "KEY123"})
     tempfile_response = FakeAPIResponse(
         url=TEMPFILE_URL,
         headers={"content-type": "text/csv"},
         body=b"Product,Region\nWidget,East\n",
     )
-    request_ctx = FakeAPIRequestContext(post_response=export_response, get_response=tempfile_response)
-    context = FakeBrowserContext(request_context=request_ctx)
+    request_ctx = FakeAPIRequestContext(
+        post_responses=[tab_pres_model_response, export_response], get_response=tempfile_response
+    )
+    context = FakeBrowserContext(
+        request_context=request_ctx, cookies=[{"name": "XSRF-TOKEN", "value": "xsrf-value-123"}]
+    )
     page = ScriptedPage(script=[download_btn, data_item], popup=popup, context=context)
 
-    result = _export_crosstab_csv(page, capture, tmp_path)
+    result = _export_crosstab_csv(page, tmp_path)
 
     download_btn.click.assert_called_once()
     data_item.click.assert_called_once()
 
-    assert len(request_ctx.post_calls) == 1
-    post_call = request_ctx.post_calls[0]
-    assert post_call["url"] == EXPORT_COMMAND_URL
-    assert post_call["headers"]["X-XSRF-TOKEN"] == "xsrf-value-123"
-    assert post_call["multipart"]["visualIdPresModel"] == "visual-abc"
-    assert json.loads(post_call["multipart"]["columns"]) == ["Product", "Region"]
+    assert len(request_ctx.post_calls) == 2
+    tab_pres_call, export_call = request_ctx.post_calls
+    assert tab_pres_call["url"] == TAB_PRES_MODEL_URL
+    assert export_call["url"] == EXPORT_COMMAND_URL
+    assert export_call["headers"]["X-XSRF-TOKEN"] == "xsrf-value-123"
+    assert export_call["multipart"]["visualIdPresModel"] == "visual-abc"
+    assert json.loads(export_call["multipart"]["columns"]) == ["Product", "Region"]
 
     assert len(request_ctx.get_calls) == 1
     get_call = request_ctx.get_calls[0]
@@ -663,7 +678,7 @@ def test_export_crosstab_csv_full_flow_reproduces_vizql_export_commands(tmp_path
 def test_export_crosstab_csv_raises_and_screenshots_when_download_button_missing(tmp_path):
     page = ScriptedPage(script=[])
     with pytest.raises(BrowserAutomationError, match="Download toolbar button"):
-        _export_crosstab_csv(page, _ViewDataSessionCapture(), tmp_path)
+        _export_crosstab_csv(page, tmp_path)
     page.screenshot.assert_called_once()
 
 
@@ -671,7 +686,7 @@ def test_export_crosstab_csv_raises_when_data_menuitem_missing(tmp_path):
     download_btn = FakeLocator()
     page = ScriptedPage(script=[download_btn])  # data item absent
     with pytest.raises(BrowserAutomationError, match="'Data' item"):
-        _export_crosstab_csv(page, _ViewDataSessionCapture(), tmp_path)
+        _export_crosstab_csv(page, tmp_path)
     page.screenshot.assert_called_once()
 
 
@@ -684,7 +699,7 @@ def test_export_crosstab_csv_raises_when_view_data_popup_does_not_open(tmp_path)
     page = ScriptedPage(script=[download_btn, data_item], popup=None)
 
     with pytest.raises(BrowserAutomationError, match="View Data' popup window did not open"):
-        _export_crosstab_csv(page, _ViewDataSessionCapture(), tmp_path)
+        _export_crosstab_csv(page, tmp_path)
     page.screenshot.assert_called_once()
 
 
@@ -703,123 +718,137 @@ def test_find_key_recursive_returns_none_when_absent():
     assert _find_key_recursive("not a container", "missing") is None
 
 
-def test_view_data_session_capture_is_complete_requires_core_fields_but_not_columns():
+def test_view_data_session_capture_has_session_requires_core_fields():
     capture = _ViewDataSessionCapture()
-    assert not capture.is_complete()
+    assert not capture.has_session()
 
-    capture.origin = "https://insight.example.com"
-    capture.command_path_prefix = "w/ReturnRotate/v/Dashboard1"
-    capture.session_id = "SESSIONABC"
+    capture.origin = SESSION_ORIGIN
+    capture.command_path_prefix = SESSION_PATH_PREFIX
+    capture.session_id = SESSION_ID
+    assert not capture.has_session()  # xsrf_token still missing
+
     capture.xsrf_token = "token"
-    assert not capture.is_complete()  # visual_id_pres_model still missing
-
-    capture.visual_id_pres_model = "visual-abc"
-    assert capture.is_complete()  # columns deliberately not required
+    assert capture.has_session()  # visualIdPresModel/columns not required here
 
 
-def test_capture_bootstrap_request_extracts_session_context_and_xsrf_token():
+def test_find_vizql_session_in_resource_urls_extracts_session_context():
+    result = _find_vizql_session_in_resource_urls(
+        ["https://insight.example.com/static/app.js", BOOTSTRAP_RESOURCE_URL]
+    )
+    assert result == (SESSION_ORIGIN, SESSION_PATH_PREFIX, SESSION_ID)
+
+
+def test_find_vizql_session_in_resource_urls_returns_none_when_no_match():
+    assert _find_vizql_session_in_resource_urls(["https://insight.example.com/static/app.js"]) is None
+    assert _find_vizql_session_in_resource_urls([]) is None
+
+
+def test_find_xsrf_token_in_cookies_matches_known_cookie_names():
+    context = FakeBrowserContext(cookies=[{"name": "XSRF-TOKEN", "value": "the-real-token"}])
+    assert _find_xsrf_token_in_cookies(context) == "the-real-token"
+
+
+def test_find_xsrf_token_in_cookies_returns_none_when_absent():
+    context = FakeBrowserContext(cookies=[{"name": "session", "value": "irrelevant"}])
+    assert _find_xsrf_token_in_cookies(context) is None
+
+
+def test_find_xsrf_token_in_cookies_never_raises_when_cookies_fails():
+    class BrokenContext:
+        def cookies(self):
+            raise RuntimeError("boom")
+
+    assert _find_xsrf_token_in_cookies(BrokenContext()) is None
+
+
+def test_discover_active_vizql_session_finds_session_on_second_page():
+    """The main dashboard page has nothing useful, but the popup does --
+    both are checked."""
     capture = _ViewDataSessionCapture()
-    request = FakeRequest(url=BOOTSTRAP_URL, headers={"x-xsrf-token": "the-real-token"})
+    main_page = ScriptedPage(script=[], resource_urls=[])
+    popup = ViewDataPopupPage(resource_urls=[BOOTSTRAP_RESOURCE_URL])
+    main_page.context = FakeBrowserContext(cookies=[{"name": "XSRF-TOKEN", "value": "the-real-token"}])
 
-    _capture_bootstrap_request(request, capture)
+    _discover_active_vizql_session([main_page, popup], capture)
 
-    assert capture.origin == "https://insight.example.com"
-    assert capture.command_path_prefix == "w/ReturnRotate/v/Dashboard1"
-    assert capture.session_id == "SESSIONABC"
+    assert capture.origin == SESSION_ORIGIN
+    assert capture.command_path_prefix == SESSION_PATH_PREFIX
+    assert capture.session_id == SESSION_ID
     assert capture.xsrf_token == "the-real-token"
 
 
-def test_capture_bootstrap_request_ignores_non_vizql_command_urls():
-    capture = _ViewDataSessionCapture()
-    request = FakeRequest(url="https://insight.example.com/some/other/api", headers={"x-xsrf-token": "t"})
+def test_discover_active_vizql_session_returns_immediately_when_already_complete():
+    capture = _make_completed_capture()
+    main_page = ScriptedPage(script=[])
 
-    _capture_bootstrap_request(request, capture)
-
-    assert capture.session_id is None
-
-
-def test_capture_bootstrap_request_ignores_export_and_tempfile_urls():
-    """These are the calls _export_view_data_via_vizql_commands() issues
-    itself -- they must not be (re-)captured as if they were bootstrap
-    commands."""
-    capture = _ViewDataSessionCapture()
-    _capture_bootstrap_request(FakeRequest(url=EXPORT_COMMAND_URL, headers={"x-xsrf-token": "t"}), capture)
-    _capture_bootstrap_request(FakeRequest(url=TEMPFILE_URL, headers={"x-xsrf-token": "t"}), capture)
-
-    assert capture.session_id is None
+    _discover_active_vizql_session([main_page], capture)  # must not raise
+    main_page.wait_for_timeout.assert_not_called()
 
 
-def test_capture_bootstrap_request_never_raises_when_header_value_fails():
-    class BrokenRequest:
-        url = BOOTSTRAP_URL
+def test_discover_active_vizql_session_raises_on_timeout(monkeypatch):
+    import src.exportbot.browser_crosstab as bc
 
-        def header_value(self, name):
-            raise RuntimeError("boom")
+    monkeypatch.setattr(bc, "VIEW_DATA_POPUP_TIMEOUT_MS", 10)
+    capture = _ViewDataSessionCapture()  # never discoverable
+    main_page = ScriptedPage(script=[], resource_urls=[])
+    main_page.context = FakeBrowserContext(cookies=[])
 
-    capture = _ViewDataSessionCapture()
-    _capture_bootstrap_request(BrokenRequest(), capture)  # must not raise
-    assert capture.session_id == "SESSIONABC"  # URL-derived fields still captured
-    assert capture.xsrf_token is None
+    with pytest.raises(BrowserAutomationError, match="Could not discover an active VizQL session"):
+        _discover_active_vizql_session([main_page], capture)
 
 
-def test_capture_bootstrap_response_extracts_pres_model_and_columns():
-    capture = _ViewDataSessionCapture()
-    response = FakeAPIResponse(
-        url=BOOTSTRAP_URL,
-        json_body={"deeply": {"nested": {"visualIdPresModel": "visual-abc", "columns": ["Product", "Region"]}}},
-    )
+def test_safe_response_text_snippet_truncates_body():
+    response = FakeAPIResponse(url=TAB_PRES_MODEL_URL, json_body={})
+    response.text = lambda: "x" * 1000
+    assert len(_safe_response_text_snippet(response)) == 300
 
-    _capture_bootstrap_response(response, capture)
+
+def test_safe_response_text_snippet_never_raises_when_text_fails():
+    response = FakeAPIResponse(url=TAB_PRES_MODEL_URL, json_body={})
+
+    def _raise():
+        raise RuntimeError("boom")
+
+    response.text = _raise
+    assert _safe_response_text_snippet(response) == "<no response body available>"
+
+
+def test_fetch_view_data_dialog_tab_pres_model_success():
+    capture = _make_completed_capture(visual_id_pres_model=None, columns=None)
+    request_ctx = FakeAPIRequestContext(post_responses=[_make_tab_pres_model_response()])
+
+    _fetch_view_data_dialog_tab_pres_model(request_ctx, capture)
 
     assert capture.visual_id_pres_model == "visual-abc"
     assert capture.columns == ["Product", "Region"]
+    assert request_ctx.post_calls[0]["url"] == TAB_PRES_MODEL_URL
+    assert request_ctx.post_calls[0]["headers"]["X-XSRF-TOKEN"] == "xsrf-value-123"
 
 
-def test_capture_bootstrap_response_ignores_non_string_list_columns():
-    capture = _ViewDataSessionCapture()
-    response = FakeAPIResponse(url=BOOTSTRAP_URL, json_body={"columns": [1, 2, 3]})
-
-    _capture_bootstrap_response(response, capture)
-
-    assert capture.columns is None
-
-
-def test_capture_bootstrap_response_never_raises_when_body_is_not_json():
-    capture = _ViewDataSessionCapture()
-    response = FakeAPIResponse(url=BOOTSTRAP_URL, json_body=None)  # .json() raises ValueError
-
-    _capture_bootstrap_response(response, capture)  # must not raise
-    assert capture.visual_id_pres_model is None
-
-
-def test_attach_vizql_bootstrap_listeners_registers_both_handlers():
-    context = FakeBrowserContext()
-    capture = _ViewDataSessionCapture()
-
-    _attach_vizql_bootstrap_listeners(context, capture)  # must not raise
-
-
-def test_attach_vizql_bootstrap_listeners_never_raises_when_on_fails():
-    context = FakeBrowserContext(on_raises=True)
-    capture = _ViewDataSessionCapture()
-
-    _attach_vizql_bootstrap_listeners(context, capture)  # must not raise
-
-
-def test_wait_for_view_data_session_capture_returns_immediately_when_already_complete():
+def test_fetch_view_data_dialog_tab_pres_model_raises_when_post_fails():
     capture = _make_completed_capture()
-    page = ScriptedPage(script=[])
+    request_ctx = FakeAPIRequestContext(post_raises=RuntimeError("network error"))
 
-    _wait_for_view_data_session_capture(page, capture, 1_000)  # must not raise
-    page.wait_for_timeout.assert_not_called()
+    with pytest.raises(BrowserAutomationError, match="Could not issue the View Data tab presentation model command"):
+        _fetch_view_data_dialog_tab_pres_model(request_ctx, capture)
 
 
-def test_wait_for_view_data_session_capture_raises_on_timeout():
-    capture = _ViewDataSessionCapture()  # never completes
-    page = ScriptedPage(script=[])
+def test_fetch_view_data_dialog_tab_pres_model_raises_on_non_ok_status():
+    capture = _make_completed_capture()
+    response = FakeAPIResponse(url=TAB_PRES_MODEL_URL, status=500, json_body={})
+    request_ctx = FakeAPIRequestContext(post_responses=[response])
 
-    with pytest.raises(BrowserAutomationError, match="Timed out waiting to observe"):
-        _wait_for_view_data_session_capture(page, capture, 10)
+    with pytest.raises(BrowserAutomationError, match="HTTP 500"):
+        _fetch_view_data_dialog_tab_pres_model(request_ctx, capture)
+
+
+def test_fetch_view_data_dialog_tab_pres_model_raises_when_visual_id_pres_model_missing():
+    capture = _make_completed_capture(visual_id_pres_model=None)
+    response = FakeAPIResponse(url=TAB_PRES_MODEL_URL, json_body={"nothing": "here"})
+    request_ctx = FakeAPIRequestContext(post_responses=[response])
+
+    with pytest.raises(BrowserAutomationError, match="no visualIdPresModel was found"):
+        _fetch_view_data_dialog_tab_pres_model(request_ctx, capture)
 
 
 def test_export_view_data_via_vizql_commands_success(tmp_path):
@@ -828,15 +857,30 @@ def test_export_view_data_via_vizql_commands_success(tmp_path):
     tempfile_response = FakeAPIResponse(
         url=TEMPFILE_URL, headers={"content-type": "text/csv"}, body=b"a,b\n1,2\n"
     )
-    request_ctx = FakeAPIRequestContext(post_response=export_response, get_response=tempfile_response)
+    request_ctx = FakeAPIRequestContext(
+        post_responses=[_make_tab_pres_model_response(), export_response], get_response=tempfile_response
+    )
     page = ScriptedPage(script=[], context=FakeBrowserContext(request_context=request_ctx))
     popup = ViewDataPopupPage()
 
     result = _export_view_data_via_vizql_commands(page, popup, capture, tmp_path)
 
-    assert request_ctx.post_calls[0]["url"] == EXPORT_COMMAND_URL
+    assert request_ctx.post_calls[0]["url"] == TAB_PRES_MODEL_URL
+    assert request_ctx.post_calls[1]["url"] == EXPORT_COMMAND_URL
     assert request_ctx.get_calls[0]["url"] == TEMPFILE_URL
     assert result.read_bytes() == b"a,b\n1,2\n"
+
+
+def test_export_view_data_via_vizql_commands_raises_when_session_not_discoverable(tmp_path, monkeypatch):
+    import src.exportbot.browser_crosstab as bc
+
+    monkeypatch.setattr(bc, "VIEW_DATA_POPUP_TIMEOUT_MS", 10)
+    capture = _ViewDataSessionCapture()
+    page = ScriptedPage(script=[], resource_urls=[], context=FakeBrowserContext(cookies=[]))
+    popup = ViewDataPopupPage(resource_urls=[])
+
+    with pytest.raises(BrowserAutomationError, match="Could not discover an active VizQL session"):
+        _export_view_data_via_vizql_commands(page, popup, capture, tmp_path)
 
 
 def test_export_view_data_via_vizql_commands_raises_when_post_fails(tmp_path):
@@ -845,15 +889,14 @@ def test_export_view_data_via_vizql_commands_raises_when_post_fails(tmp_path):
     page = ScriptedPage(script=[], context=FakeBrowserContext(request_context=request_ctx))
     popup = ViewDataPopupPage()
 
-    with pytest.raises(BrowserAutomationError, match="Could not issue the View Data export command"):
+    with pytest.raises(BrowserAutomationError, match="Could not issue the View Data tab presentation model command"):
         _export_view_data_via_vizql_commands(page, popup, capture, tmp_path)
-    popup.screenshot.assert_called_once()
 
 
 def test_export_view_data_via_vizql_commands_raises_on_non_ok_status(tmp_path):
     capture = _make_completed_capture()
     export_response = FakeAPIResponse(url=EXPORT_COMMAND_URL, status=500, json_body={})
-    request_ctx = FakeAPIRequestContext(post_response=export_response)
+    request_ctx = FakeAPIRequestContext(post_responses=[_make_tab_pres_model_response(), export_response])
     page = ScriptedPage(script=[], context=FakeBrowserContext(request_context=request_ctx))
     popup = ViewDataPopupPage()
 
@@ -864,7 +907,7 @@ def test_export_view_data_via_vizql_commands_raises_on_non_ok_status(tmp_path):
 def test_export_view_data_via_vizql_commands_raises_when_result_key_missing(tmp_path):
     capture = _make_completed_capture()
     export_response = FakeAPIResponse(url=EXPORT_COMMAND_URL, json_body={"nothing": "here"})
-    request_ctx = FakeAPIRequestContext(post_response=export_response)
+    request_ctx = FakeAPIRequestContext(post_responses=[_make_tab_pres_model_response(), export_response])
     page = ScriptedPage(script=[], context=FakeBrowserContext(request_context=request_ctx))
     popup = ViewDataPopupPage()
 
@@ -875,7 +918,10 @@ def test_export_view_data_via_vizql_commands_raises_when_result_key_missing(tmp_
 def test_export_view_data_via_vizql_commands_raises_when_tempfile_fetch_fails(tmp_path):
     capture = _make_completed_capture()
     export_response = FakeAPIResponse(url=EXPORT_COMMAND_URL, json_body={"resultKey": "KEY123"})
-    request_ctx = FakeAPIRequestContext(post_response=export_response, get_raises=RuntimeError("network error"))
+    request_ctx = FakeAPIRequestContext(
+        post_responses=[_make_tab_pres_model_response(), export_response],
+        get_raises=RuntimeError("network error"),
+    )
     page = ScriptedPage(script=[], context=FakeBrowserContext(request_context=request_ctx))
     popup = ViewDataPopupPage()
 
@@ -1029,62 +1075,9 @@ def test_run_browser_crosstab_export_orchestrates_and_closes_browser(tmp_path):
     )
     mock_login.assert_called_once_with(fake_page, "user", "pass")
     mock_wait.assert_called_once_with(fake_page)
-    mock_export.assert_called_once()
-    export_call_args = mock_export.call_args.args
-    assert export_call_args[0] is fake_page
-    assert isinstance(export_call_args[1], _ViewDataSessionCapture)
-    assert export_call_args[2] == tmp_path
+    mock_export.assert_called_once_with(fake_page, tmp_path)
     fake_browser.close.assert_called_once()
     fake_chromium.launch.assert_called_once_with(headless=True)
-
-
-def test_run_browser_crosstab_export_attaches_vizql_bootstrap_listeners_before_wait_for_dashboard(tmp_path):
-    """The fix for a real-server timeout: an earlier version attached the
-    VizQL bootstrap capture right before the "Data" click, inside
-    _export_crosstab_csv() -- too late, since a Tableau viz establishes
-    its VizQL session during the dashboard's own initial load, not when
-    the View Data dialog is opened. It must now be attached right after
-    the dashboard navigation, before _wait_for_dashboard() -- this test
-    pins that ordering via a shared call-order mock so a future change
-    can't silently move it later again."""
-    manager = MagicMock()
-    fake_browser = manager.browser
-    fake_context = manager.context
-    fake_page = manager.page
-    fake_context.new_page.return_value = fake_page
-    fake_browser.new_context.return_value = fake_context
-
-    fake_chromium = MagicMock()
-    fake_chromium.launch.return_value = fake_browser
-    fake_driver = MagicMock()
-    fake_driver.chromium = fake_chromium
-    fake_cm = MagicMock()
-    fake_cm.__enter__.return_value = fake_driver
-    fake_cm.__exit__.return_value = False
-
-    with patch("playwright.sync_api.sync_playwright", return_value=fake_cm):
-        with patch("src.exportbot.browser_crosstab._login_if_needed"):
-            with patch(
-                "src.exportbot.browser_crosstab._wait_for_dashboard", side_effect=manager.wait_for_dashboard
-            ):
-                with patch(
-                    "src.exportbot.browser_crosstab._export_crosstab_csv",
-                    return_value=tmp_path / "x.csv",
-                ):
-                    run_browser_crosstab_export(
-                        server_url="https://insight.example.com",
-                        username="user",
-                        password="pass",
-                        export_dir=str(tmp_path),
-                        headless=True,
-                    )
-
-    on_call_names = [
-        name
-        for name, _args, _kwargs in manager.mock_calls
-        if name in ("context.on", "wait_for_dashboard")
-    ]
-    assert on_call_names == ["context.on", "context.on", "wait_for_dashboard"]
 
 
 def test_run_browser_crosstab_export_passes_executable_path(tmp_path):

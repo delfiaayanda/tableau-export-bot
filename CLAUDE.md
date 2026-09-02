@@ -791,6 +791,110 @@ can't silently move the attachment later again. **Still not run against
 the real server** -- the next run is what will show whether attaching
 this early actually captures the session context in practice.
 
+### Discovering the session instead of observing it -- listeners abandoned entirely
+
+**A user then ran the earlier-attachment fix against the real server and
+it timed out again, having captured nothing at all** -- even though the
+dashboard loaded and the View Data popup opened correctly. Two separate
+real-server runs of a listener-based approach (first attached right
+before the "Data" click, then moved to right after the dashboard
+navigation) both failed to observe a single VizQL bootstrap command.
+This is strong evidence the problem was never about *when* the listener
+was attached: these commands are not reliably observable as ordinary
+Playwright page-level network events at all in this environment, for
+reasons this project could not pin down further without another live
+round trip (a different network domain/target than Playwright's
+page-level CDP hookup, a Service Worker, or something else entirely).
+
+Rather than attempt a third listener-timing variant, the strategy
+changed completely: instead of trying to *observe* the VizQL session
+being established, **discover it from browser state that already exists
+once the page has loaded** -- no listener, no timing race, no "was
+anything listening at the right moment" question at all:
+
+- `_discover_active_vizql_session()` reads the standard **Performance
+  Resource Timing API** (`performance.getEntriesByType("resource")`,
+  evaluated via `page.evaluate()`) on both the main dashboard page and
+  the View Data popup. Every browser keeps this list for the life of the
+  page regardless of whether a Playwright listener existed when the
+  request happened -- and any interactive Tableau viz *must* have issued
+  at least one VizQL session-scoped command just to render, so a
+  matching URL is already sitting in this list by the time the dashboard
+  (or popup) has visibly loaded. `_find_vizql_session_in_resource_urls()`
+  searches those URLs with the same `VIZQL_SESSION_ID_RE` used
+  previously, extracting the origin, workbook/view path prefix, and
+  session id.
+- The `X-XSRF-TOKEN` value is read directly from its matching cookie
+  (`_find_xsrf_token_in_cookies()`, via `context.cookies()`) instead of
+  waited for on some outgoing request's headers. Tableau's own header
+  name is exactly Angular's default double-submit-cookie header, which
+  Angular's `HttpClientXsrfModule` only ever populates from a
+  same-named cookie (`XSRF-TOKEN` / `X-XSRF-TOKEN`) -- so the value is
+  already sitting in the cookie jar too, no request needed.
+- This runs as a short, bounded poll (`_ViewDataSessionCapture.has_session()`
+  checked each tick, reusing the existing `VIEW_DATA_POPUP_TIMEOUT_MS` --
+  no new or longer timeout added) purely as a safety margin for the
+  Performance buffer not having recorded anything at the *exact* instant
+  this is first called, not as a network-event wait.
+
+Once a session is discovered, the code no longer waits to *observe* the
+`get-view-data-dialog-tab-pres-model` bootstrap command either -- it
+issues that HAR-confirmed command **itself**,
+`_fetch_view_data_dialog_tab_pres_model()`, via the browser's own
+authenticated request context, and reads `visualIdPresModel`/`columns`
+directly from its own response (same `_find_key_recursive()` search as
+before). Its only field is `telemetryCommandId` -- the one field
+confirmed common to sibling `tabsrv` commands in the HAR notes above; no
+other field is invented. `launch-hybrid-view-data-dialog` and
+`view-data-dialog-show-aliases` are deliberately **not** issued by this
+project: their exact request bodies were never captured, and the "Data"
+click already opens the real popup, whose own internal JS (even though
+it renders nothing visible) very plausibly already performs any
+server-side "launch" step on its own -- issuing them ourselves would
+mean inventing payloads for commands whose fields are unconfirmed,
+which was explicitly ruled out.
+
+`_export_view_data_via_vizql_commands()` now sequences all of this:
+discover the session, fetch the tab presentation model, POST the export
+command, GET the tempfile, save it (`_save_tempfile_response()`,
+unchanged). All of the old listener machinery
+(`_attach_vizql_bootstrap_listeners`, `_capture_bootstrap_request`,
+`_capture_bootstrap_response`, `_wait_for_view_data_session_capture`,
+and the early-attachment code this added to `run_browser_crosstab_export()`)
+was removed as dead code -- `_export_crosstab_csv()` and
+`run_browser_crosstab_export()` are back to their simpler, pre-listener
+call shape (`_export_crosstab_csv(page, export_dir)`), with `capture`
+now created and populated entirely within the export step itself.
+
+Error messages for both the tab-pres-model command and the export
+command now include the real HTTP status **and a truncated response
+body** (`_safe_response_text_snippet()`, capped at 300 chars -- the same
+convention already used in `crosstab_probe.py`) directly in the
+exception text, so a real failure is diagnosable from the error alone,
+without a further debug round trip.
+
+Regression tests (`tests/test_browser_crosstab.py`) cover:
+`_find_vizql_session_in_resource_urls()` (extracts session context from
+a matching URL, returns `None` when nothing matches); `_find_xsrf_token_in_cookies()`
+(matches known cookie names, returns `None` when absent, never raises
+when `.cookies()` fails); `_discover_active_vizql_session()` (finds the
+session via a *second* page's resource URLs when the first has none,
+returns immediately when the capture is already complete, raises on
+timeout); `_safe_response_text_snippet()` (truncates to 300 chars, never
+raises when reading the body fails); `_fetch_view_data_dialog_tab_pres_model()`
+(success path asserting the exact request made, and the network-error,
+non-OK-status, and missing-`visualIdPresModel` failure cases); and the
+full `_export_view_data_via_vizql_commands()` / `_export_crosstab_csv()`
+flows re-verified end to end through the two-POST sequence (tab
+presentation model, then export) via fake Performance-resource-URL and
+cookie state. **Still not run against the real server** -- the next run
+is what will show whether the Performance Resource Timing API and
+cookie jar actually contain what this expects in practice, and whether
+issuing `get-view-data-dialog-tab-pres-model` without a prior
+`launch-hybrid-view-data-dialog` call from this project (relying on the
+popup's own click-triggered JS to have done it) is accepted by the
+server.
+
 ## What is tested vs. not
 
 Tested in this environment (`pytest`, no network):
@@ -858,21 +962,24 @@ Tested in this environment (`pytest`, no network):
   fake `expect_popup()`, the popup-never-opens error path,
   debug-screenshot-on-failure, and the full flow through to a saved CSV
   via a fake browser context), `_find_key_recursive()` (nested dict,
-  nested list, not-found), `_ViewDataSessionCapture.is_complete()` (all
-  core fields required, `columns` deliberately not),
-  `_capture_bootstrap_request()` (extracts session id/origin/path-prefix/
-  XSRF token from a real VizQL command URL and its own header, ignores
-  non-VizQL and export/tempfile URLs, never raises when header access
-  fails), `_capture_bootstrap_response()` (extracts `visualIdPresModel`/
-  `columns` via recursive key search, rejects a non-string-list
-  `columns`, never raises on an unparseable body),
-  `_attach_vizql_bootstrap_listeners()` (never raises when `.on()`
-  fails), `_wait_for_view_data_session_capture()` (returns immediately
-  when already complete, raises on timeout),
-  `_export_view_data_via_vizql_commands()` (the full POST
-  export-command -> GET tempfile success path, asserting the exact
-  calls made and the saved file's contents, plus network-error,
-  non-OK-status, missing-`resultKey`, and tempfile-fetch-failure cases),
+  nested list, not-found), `_ViewDataSessionCapture.has_session()`
+  (requires origin/path-prefix/session-id/XSRF token, not
+  visualIdPresModel/columns), `_find_vizql_session_in_resource_urls()`
+  (extracts session context from a matching Performance-resource URL,
+  returns `None` on no match), `_find_xsrf_token_in_cookies()` (matches
+  known cookie names, returns `None` when absent, never raises when
+  `.cookies()` fails), `_discover_active_vizql_session()` (finds the
+  session via a second page's resource URLs when the first has none,
+  returns immediately when already complete, raises on timeout),
+  `_safe_response_text_snippet()` (truncates to 300 chars, never raises
+  when reading the body fails), `_fetch_view_data_dialog_tab_pres_model()`
+  (success path asserting the exact request made, plus network-error,
+  non-OK-status, and missing-`visualIdPresModel` failure cases),
+  `_export_view_data_via_vizql_commands()` (the full discover -> fetch
+  tab-pres-model -> POST export-command -> GET tempfile success path,
+  asserting the exact calls made and the saved file's contents, plus
+  session-not-discoverable, network-error, non-OK-status,
+  missing-`resultKey`, and tempfile-fetch-failure cases),
   `_is_export_related_url()` (matches only the two HAR-confirmed URL
   fragments), `_extract_filename_from_content_disposition()` (plain and
   RFC 5987 forms, absent header), `_sanitize_filename()` (strips path
@@ -905,15 +1012,21 @@ automation" above for exactly why):
   live dashboard's real markup — entirely unverified; they're
   best-effort accessible-role/name guesses, not confirmed by inspection.
 - Whether the login form is detected/filled correctly on the real page.
-- Whether the VizQL command reproduction (see "Reproducing the export
-  command directly" above) actually works end to end against the real
-  server: whether the captured session id, `X-XSRF-TOKEN`,
-  `visualIdPresModel`, and origin/path prefix are sufficient for Tableau
-  to accept the `export-view-data-summary-to-csv-server` POST issued via
-  `page.context.request` (as opposed to a real browser-driven request),
-  whether `resultKey` is actually found in its response, whether the
-  `tempfile` GET succeeds, and whether the exported CSV is complete when
-  `columns` could not be captured (sent as an empty list).
+- Whether the session-discovery approach (see "Discovering the session
+  instead of observing it" above) actually works end to end against the
+  real server: whether `performance.getEntriesByType("resource")` really
+  contains a matching VizQL command URL by the time it's checked,
+  whether the XSRF cookie is really named `XSRF-TOKEN` (or the other
+  checked variant) on this server, whether `get-view-data-dialog-tab-pres-model`
+  is accepted without this project having issued
+  `launch-hybrid-view-data-dialog` itself first, whether the discovered
+  session id/XSRF token/`visualIdPresModel`/origin/path prefix are
+  sufficient for Tableau to accept the `export-view-data-summary-to-csv-server`
+  POST issued via `page.context.request` (as opposed to a real
+  browser-driven request), whether `resultKey` is actually found in its
+  response, whether the `tempfile` GET succeeds, and whether the
+  exported CSV is complete when `columns` could not be captured (sent as
+  an empty list).
 
 Not tested, requires a machine with access to `insight.erajaya.com`:
 - `discover_api_version()` against the real `serverinfo` endpoint (a user
