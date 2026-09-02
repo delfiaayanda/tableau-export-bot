@@ -100,7 +100,45 @@ get_by_text() was the one that matched: the real element is a plain
 (get_by_text() first, plus a couple of additional low-risk fallbacks --
 see the comment above that list) on the reasonable, evidence-based
 assumption that "Download" is built with the same UI toolkit as "Full
-Data". Not yet confirmed live.
+Data". Confirmed live: a subsequent run found and clicked both real
+controls (confirmed selectors are now listed first -- see the comments
+above FULL_DATA_TAB_CANDIDATES / VIEW_DATA_DOWNLOAD_BUTTON_CANDIDATES)
+and the export genuinely fired (`export-view-data-underlying-to-csv-server`
+-> tempfile, both HTTP 200) -- but the run still failed, and the saved
+file, once inspected, turned out not to be a usable CSV at all (see
+below).
+
+**The saved file wasn't CSV: `Response.body()` conflicts with Chrome's
+own native download handling.** A screenshot from that run showed
+Chrome's own "Recent download history" panel had completed a real
+72.5 MB download with no filename at all (a bare GUID, no extension) --
+proof that Chrome's network stack recognized the tempfile response's
+`Content-Disposition: attachment` header and diverted it to its native
+download manager, independently of anything this project's Python code
+does with that same response. This is a known Playwright limitation:
+once Chrome claims a response as a download, its body is generally not
+reliably available via `Response.body()` (the DevTools Protocol call
+this project's own capture depends on) any more -- so the earlier fix
+that stopped calling `.body()` inside the event handler (see below) was
+necessary but not sufficient; calling it later, on the main flow, can
+still return the wrong thing once Chrome has taken the response for its
+downloads UI.
+
+Fixed by capturing the actual `Download` object Playwright's context
+emits (`_DownloadCapture` / `_capture_download` / `_attach_download_capture`
+/ `_wait_for_download_capture`, attached at the browser CONTEXT level as
+early as possible, mirroring `_TempfileCapture`) and reading its real
+bytes from `download.path()` -- the local file Chrome already finished
+writing -- instead of `response.body()`. `_save_tempfile_response()` now
+takes an optional `download` parameter: when present, it's the source of
+truth for both the bytes and (when Content-Disposition didn't supply a
+usable name) the filename, EXCEPT that a `suggested_filename` without a
+recognizable `.csv`/`.txt` extension (exactly what that GUID was) is
+treated as unusable and a generated name is used instead -- otherwise
+this fix would just relabel the same "not a csv file" symptom. When no
+download ever fires (a future Tableau version, a different browser
+config), this falls back to `response.body()` exactly as before, so nothing
+regresses in that case.
 
 NOT exercised against the real server from this environment: no browser
 binary is installed here (Chromium download is blocked by this sandbox's
@@ -168,6 +206,7 @@ DASHBOARD_LOAD_TIMEOUT_MS = 60_000
 POLL_INTERVAL_MS = 500
 VIEW_DATA_POPUP_TIMEOUT_MS = 30_000
 NETWORK_EXPORT_TIMEOUT_MS = 30_000
+DOWNLOAD_EVENT_GRACE_PERIOD_MS = 5_000
 
 # The HAR-confirmed URL fragments of the two network calls that matter for
 # the actual export, regardless of which page (main dashboard or the
@@ -603,6 +642,72 @@ def _capture_tempfile_response(response, capture: _TempfileCapture) -> None:
         print(f"[NETDEBUG] failed to capture a tempfile response: {exc}")
 
 
+class _DownloadCapture:
+    """Holds the browser's own Download object once observed, populated
+    by _capture_download()."""
+
+    def __init__(self):
+        self.download = None
+
+
+def _capture_download(download, capture: "_DownloadCapture") -> None:
+    """Passively records the first "download" event fired anywhere in
+    the browser context.
+
+    A real-server run showed Chrome for Testing's own native download
+    handling claims the tempfile response as soon as it sees its
+    `Content-Disposition: attachment` header -- visible in the browser's
+    own "Recent download history" panel -- independently of whatever a
+    Playwright script does with that same response. When that happens,
+    Chrome hands the body off to its download manager instead of
+    buffering it for the DevTools Protocol, so `Response.body()` can
+    return the wrong thing (or fail) for that exact response -- a known
+    Playwright limitation, and the reason the saved file in that run
+    matched what the browser had downloaded (a bare GUID, no `.csv`
+    name) rather than a real CSV. This captures the actual `Download`
+    object instead; its bytes are read from `download.path()` afterwards
+    on the main flow, in _save_tempfile_response(). Never raises."""
+    try:
+        if capture.download is not None:
+            return
+        capture.download = download
+        print("[NETDEBUG] captured a browser download event")
+    except Exception as exc:
+        print(f"[NETDEBUG] failed to capture a download event: {exc}")
+
+
+def _attach_download_capture(page, capture: "_DownloadCapture") -> None:
+    """Attaches _capture_download() at the BROWSER CONTEXT level (reached
+    via `page.context`), not a specific page -- Playwright's "download"
+    event is emitted on whichever page's JS actually triggers it (the
+    main dashboard or the "View Data" popup), and the context aggregates
+    both, matching this module's existing "don't assume which page"
+    pattern for network capture. Takes `page` rather than the context
+    directly so that a fake/test page without a `.context` attribute at
+    all is handled by the same try/except as a real `.on()` failure.
+    Never raises."""
+    try:
+        page.context.on("download", lambda download: _capture_download(download, capture))
+    except Exception as exc:
+        print(f"[NETDEBUG] could not attach download listener: {exc}")
+
+
+def _wait_for_download_capture(driver_page, capture: "_DownloadCapture", timeout_ms) -> None:
+    """Best-effort poll (no fixed sleep) for _capture_download() to
+    observe a real download event. Deliberately does NOT raise on
+    timeout -- a download event is a bonus signal used to get reliable
+    bytes when the browser claims the response as a native download;
+    if none ever fires (e.g. a future Tableau version, or an
+    environment where this response isn't treated as a download),
+    _save_tempfile_response() falls back to reading the captured
+    response's own body instead."""
+    deadline = time.monotonic() + timeout_ms / 1000
+    while capture.download is None:
+        if time.monotonic() >= deadline:
+            return
+        driver_page.wait_for_timeout(POLL_INTERVAL_MS)
+
+
 def _attach_export_network_diagnostics(pages, tempfile_capture: _TempfileCapture | None = None) -> None:
     """Attaches the request/response loggers above to each given page
     (typically the main dashboard page and the "View Data" popup page --
@@ -706,15 +811,29 @@ def _sanitize_filename(name: str | None) -> str | None:
     return base or None
 
 
-def _save_tempfile_response(response, export_dir: Path) -> Path:
-    """Saves a captured `.../tempfile/...` response -- the HAR-confirmed
-    final step of the real export flow -- to EXPORT_DIR. Verifies the
-    Content-Type looks like the expected CSV/text export before writing
+def _save_tempfile_response(response, export_dir: Path, download=None) -> Path:
+    """Saves the exported CSV to EXPORT_DIR. Verifies the captured
+    `.../tempfile/...` response's Content-Type looks like the expected
+    CSV/text export and its status isn't an error before writing
     anything, since this is meant to replace Playwright's `download`
     event as the success signal, not blindly trust any matching URL.
+
+    Bytes come from `download.path()` when a `Download` was captured
+    (see _capture_download()) -- the reliable source once Chrome's own
+    native download handling has claimed this exact response, which a
+    real-server run showed makes `response.body()` return the browser's
+    raw (sometimes GUID-named, un-suffixed) download rather than a
+    proper CSV. Falls back to `response.body()` when no download was
+    observed (e.g. a future Tableau version, or an environment where
+    this response isn't treated as a download).
+
     Prefers the filename Tableau itself supplied via Content-Disposition
-    (sanitized -- see _sanitize_filename), falling back to a generated
-    timestamped name if that header is absent or unusable."""
+    (sanitized -- see _sanitize_filename); if that's absent or unusable,
+    falls back to `download.suggested_filename` -- but a real-server run
+    showed that can be a bare, extension-less GUID (Chrome's own
+    placeholder, not a real name), so a name without a recognizable
+    `.csv`/`.txt` suffix is treated the same as no name at all and a
+    generated timestamped name is used instead."""
     if response.status >= 400:
         raise BrowserAutomationError(
             f"Tempfile response returned HTTP {response.status}; refusing to save it."
@@ -726,15 +845,26 @@ def _save_tempfile_response(response, export_dir: Path) -> Path:
             f"Tempfile response had an unexpected Content-Type ({content_type!r}); refusing to save it."
         )
 
-    # Read the body HERE, on the main flow -- never inside the network
+    # Read the bytes HERE, on the main flow -- never inside the network
     # event handler that captured this response (see
     # _capture_tempfile_response for why that silently failed before).
-    try:
-        body = response.body()
-    except Exception as exc:
-        raise BrowserAutomationError(
-            f"Captured the tempfile response but could not read its body: {exc}"
-        ) from exc
+    if download is not None:
+        try:
+            body = Path(download.path()).read_bytes()
+        except Exception as exc:
+            raise BrowserAutomationError(
+                f"Captured a browser download but could not read its saved file: {exc}"
+            ) from exc
+    else:
+        try:
+            body = response.body()
+        except Exception as exc:
+            raise BrowserAutomationError(
+                f"Captured the tempfile response but could not read its body: {exc}"
+            ) from exc
+
+    if not body:
+        raise BrowserAutomationError("The exported file was empty; refusing to save it.")
 
     content_disposition = None
     try:
@@ -742,6 +872,14 @@ def _save_tempfile_response(response, export_dir: Path) -> Path:
     except Exception:
         pass
     filename = _sanitize_filename(_extract_filename_from_content_disposition(content_disposition))
+
+    if not filename and download is not None:
+        try:
+            suggested = _sanitize_filename(download.suggested_filename)
+        except Exception:
+            suggested = None
+        if suggested and os.path.splitext(suggested)[1].lower() in (".csv", ".txt"):
+            filename = suggested
 
     export_dir.mkdir(parents=True, exist_ok=True)
     target_path = export_dir / (filename or generate_export_filename())
@@ -776,6 +914,16 @@ def _export_crosstab_csv(page, export_dir: Path):
     _attach_export_network_diagnostics([page], tempfile_capture)
     _attach_message_listener(page)  # TEMPORARY DEBUG ONLY -- see module docstring
 
+    # Attached at the browser CONTEXT level, as early as possible -- a
+    # real-server run showed Chrome's own native download handling
+    # claims this exact response (see _capture_download()), so the
+    # actual Download object is the reliable source of bytes, not
+    # response.body(). Attaching now, before the popup even opens,
+    # means this can't miss the event regardless of which page it fires
+    # on.
+    download_capture = _DownloadCapture()
+    _attach_download_capture(page, download_capture)
+
     # Clicking "Data" opens a separate "View Data" popup window/tab (a new
     # Playwright Page in the same browser context, titled
     # "Hybrid Popup Window") -- not an in-page dialog. This click is kept
@@ -809,7 +957,14 @@ def _export_crosstab_csv(page, export_dir: Path):
     _debug_dump_hydration_signals(page, "main dashboard page after Full Data/Download clicks")
 
     _wait_for_tempfile_capture(view_data_page, tempfile_capture, NETWORK_EXPORT_TIMEOUT_MS)
-    saved_path = _save_tempfile_response(tempfile_capture.response, export_dir)
+    # Best-effort, short grace period for the "download" event to arrive
+    # too -- it can lag slightly behind the response event while Chrome
+    # finishes writing the file to disk. Never raises: if it never
+    # fires, _save_tempfile_response() falls back to response.body().
+    _wait_for_download_capture(view_data_page, download_capture, DOWNLOAD_EVENT_GRACE_PERIOD_MS)
+    saved_path = _save_tempfile_response(
+        tempfile_capture.response, export_dir, download=download_capture.download
+    )
     try:
         print(f"Saved {saved_path} ({saved_path.stat().st_size} bytes)")
     except Exception:

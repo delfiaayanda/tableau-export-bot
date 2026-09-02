@@ -1320,6 +1320,82 @@ must **still** be captured -- plus the unreadable-URL case;
 `_wait_for_download_button_ready()` is covered for the polls-until-ready,
 unreadable-title, and never-clears paths. Full suite: 148 passed.
 
+### The saved file wasn't CSV: Chrome's own download handling beats `Response.body()`
+
+**The next real-server run drove the whole flow through a real,
+confirmed-successful export** -- `export-view-data-underlying-to-csv-server`
+then the tempfile GET, both HTTP 200, exactly as before -- but the
+resulting file wasn't usable. A screenshot showed the real "View Data"
+window with Full Data genuinely loaded (200 rows, 27 fields) and,
+overlaid on it, Chrome's own "Recent download history" panel reporting a
+completed **72.5 MB** download named only with a bare GUID -- no `.csv`,
+no descriptive name at all.
+
+That panel is Chrome's native download manager, entirely independent of
+anything this project's Python code does with the network response --
+its presence means Chrome's own network stack saw the tempfile
+response's `Content-Disposition: attachment` header and diverted the
+body to its downloads UI on its own. This is a real, known Playwright
+limitation: once Chrome claims a response as a download, `Response.body()`
+(the DevTools Protocol call `_save_tempfile_response()` depends on) is
+not reliably able to read it any more -- so the earlier fix (moving the
+`.body()` call out of the event handler, per the previous round) was
+necessary but not sufficient. Calling it later, on the main flow, can
+still return the wrong thing once Chrome has taken the response for its
+own downloads UI -- consistent with a 72.5 MB file with no name showing
+up instead of a properly named CSV.
+
+**Fix:** capture the actual Playwright `Download` object instead of
+relying on the response body at all, mirroring the existing
+`_TempfileCapture` pattern:
+
+- `_DownloadCapture` / `_capture_download()` -- passively records the
+  first "download" event observed, storing the live `Download` object
+  (never reading anything from it inside the handler, for the same
+  sync-API reason established in the previous round).
+- `_attach_download_capture(page, capture)` -- attaches at the
+  **browser context** level (`page.context.on("download", ...)`), not a
+  specific page, since the download could be triggered by JS running in
+  either the main dashboard or the "View Data" popup, and attached as
+  early as possible (right where the tempfile capture is set up, before
+  even the "Data" click) so it can't be missed regardless of timing.
+- `_wait_for_download_capture()` -- a short, deliberately non-raising
+  grace period (`DOWNLOAD_EVENT_GRACE_PERIOD_MS`, 5s) after the tempfile
+  response is already confirmed, since the download event can lag
+  slightly behind while Chrome finishes writing to disk. If it never
+  fires, nothing breaks -- `_save_tempfile_response()` just falls back
+  to the old `response.body()` path.
+- `_save_tempfile_response()` now takes an optional `download` parameter.
+  When present, its bytes -- read from `download.path()`, the local file
+  Chrome already finished writing -- are the source of truth, not
+  `response.body()`. Its `suggested_filename` is used only as a
+  fallback name when Content-Disposition didn't supply one, and only if
+  it has a recognizable `.csv`/`.txt` extension -- a bare GUID (exactly
+  what the real run showed) is treated as no name at all, so the fix
+  doesn't just relabel the same "downloaded something, not a csv file"
+  symptom under a different code path. An empty download is now also
+  explicitly rejected rather than silently written as a 0-byte file.
+
+Regression tests (`tests/test_browser_crosstab.py`) cover: `_capture_download()`
+(keeps only the first event); `_attach_download_capture()` (registers at
+the context level via `page.context`, and never raises when `.context`
+itself is missing -- covering a test fake the same way a real attribute
+error would be); `_wait_for_download_capture()` (returns immediately
+when already captured, gives up without raising on timeout);
+`_save_tempfile_response()` extended with the download-preferring path
+(bytes come from the download even when the response body would give a
+different, wrong answer; a GUID `suggested_filename` is rejected in
+favor of a generated name; a real `.csv`-suffixed suggested name IS
+used; an empty download is rejected; a `download.path()` failure
+surfaces a clear error); and a new end-to-end
+`_export_crosstab_csv()` test that fires both the tempfile response and
+a real "download" event (mirroring exactly what the live run showed)
+and confirms the saved file's bytes and name come from the download, not
+the response body or its meaningless suggested name. Full suite: 159
+passed. **Not yet run against the real server** -- the next run is what
+will show whether the saved file is finally a real, correctly-named CSV
+with the full Full Data row count.
+
 ## What is tested vs. not
 
 Tested in this environment (`pytest`, no network):
@@ -1429,10 +1505,22 @@ Tested in this environment (`pytest`, no network):
   diagnostics: registers all four listeners, never raises when `.on()`
   fails, and a dedicated secrets-never-printed check), `_describe_locator()`
   (temporary: returns a matched element's safe description, or a
-  failure string, never raises), and `run_browser_crosstab_export()`'s
-  orchestration (goto order, browser launch args, browser always
-  closed), all using hand-built fake Playwright-like objects -- no real
-  browser, no real Tableau DOM.
+  failure string, never raises), `_wait_for_download_button_ready()`
+  (polls a button's `title` until "no column data available" clears,
+  proceeds anyway when unreadable or never clearing), `_capture_download()`
+  / `_attach_download_capture()` / `_wait_for_download_capture()` (keeps
+  only the first observed download event, registers at the browser
+  context level and never raises when `.context` is missing, gives up
+  without raising on timeout), `_save_tempfile_response()`'s
+  download-preferring path (bytes come from a captured `Download`'s
+  `download.path()` rather than `response.body()` when one was
+  captured, a GUID-shaped `suggested_filename` is rejected in favor of a
+  generated name, a real `.csv`-suffixed suggested name is used, an
+  empty download is rejected, a `download.path()` failure surfaces a
+  clear error), and `run_browser_crosstab_export()`'s orchestration
+  (goto order, browser launch args, browser always closed), all using
+  hand-built fake Playwright-like objects -- no real browser, no real
+  Tableau DOM.
 - `browser_crosstab.py` (CLI) — config-error/success/failure reporting,
   mocking the export function entirely; confirms credentials never
   appear in output.

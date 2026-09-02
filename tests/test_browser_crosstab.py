@@ -15,10 +15,13 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from src.exportbot.browser_crosstab import (
+    _DownloadCapture,
     _TempfileCapture,
+    _attach_download_capture,
     _attach_export_network_diagnostics,
     _attach_message_listener,
     _attach_popup_runtime_diagnostics,
+    _capture_download,
     _capture_tempfile_response,
     _debug_dump_hydration_signals,
     _debug_dump_view_data_popup,
@@ -36,6 +39,7 @@ from src.exportbot.browser_crosstab import (
     _switch_to_full_data_and_download,
     _wait_for_dashboard,
     _wait_for_download_button_ready,
+    _wait_for_download_capture,
     _wait_for_tempfile_capture,
     generate_export_filename,
     resolve_executable_path,
@@ -128,7 +132,7 @@ class ScriptedPage(FakeEventPage):
     production code attaches network diagnostics to the main dashboard
     page too."""
 
-    def __init__(self, script, popup=None, on_raises=False):
+    def __init__(self, script, popup=None, on_raises=False, context=None):
         super().__init__(on_raises=on_raises)
         self._script = list(script)
         self._pos = 0
@@ -138,6 +142,7 @@ class ScriptedPage(FakeEventPage):
         self.wait_for_load_state = MagicMock()
         self.goto = MagicMock()
         self.screenshot = MagicMock()
+        self.context = context if context is not None else FakeEventPage()
 
     def _next(self, *args, **kwargs):
         if self._pos >= len(self._script):
@@ -831,7 +836,62 @@ def test_attach_export_network_diagnostics_also_registers_tempfile_capture_when_
     assert capture.response.body() == b"a,b\n1,2\n"
 
 
-def test_export_crosstab_csv_full_flow_switches_to_full_data_then_captures_tempfile(tmp_path):
+class FakeContextHolder:
+    """A page stand-in exposing only `.context`, for testing
+    _attach_download_capture() without needing a full page fake."""
+
+    def __init__(self, context):
+        self.context = context
+
+
+def test_capture_download_stores_first_event_only():
+    capture = _DownloadCapture()
+    first = MagicMock(name="first-download")
+    second = MagicMock(name="second-download")
+
+    _capture_download(first, capture)
+    _capture_download(second, capture)
+
+    assert capture.download is first
+
+
+def test_attach_download_capture_registers_context_level_listener():
+    context = FakeEventPage()
+    capture = _DownloadCapture()
+
+    _attach_download_capture(FakeContextHolder(context), capture)
+
+    assert len(context._handlers["download"]) == 1
+    download = MagicMock()
+    context.fire("download", download)
+    assert capture.download is download
+
+
+def test_attach_download_capture_never_raises_when_context_missing():
+    class NoContextPage:
+        pass
+
+    _attach_download_capture(NoContextPage(), _DownloadCapture())  # must not raise
+
+
+def test_wait_for_download_capture_returns_immediately_when_already_captured():
+    capture = _DownloadCapture()
+    capture.download = MagicMock()
+    page = ScriptedPage(script=[])
+
+    _wait_for_download_capture(page, capture, 1_000)
+    page.wait_for_timeout.assert_not_called()
+
+
+def test_wait_for_download_capture_gives_up_without_raising_on_timeout():
+    capture = _DownloadCapture()  # never populated
+    page = ScriptedPage(script=[])
+
+    _wait_for_download_capture(page, capture, 10)  # must not raise
+    assert capture.download is None
+
+
+def test_export_crosstab_csv_full_flow_switches_to_full_data_then_captures_tempfile(tmp_path, monkeypatch):
     """End-to-end through _export_crosstab_csv(): clicking Download ->
     Data opens the "View Data" popup, which opens on its default
     "Summary" tab. A HAR capture of the real manual workflow showed two
@@ -841,7 +901,12 @@ def test_export_crosstab_csv_full_flow_switches_to_full_data_then_captures_tempf
     simulates the whole chain: both popup clicks happen, then the
     tempfile response is fired while _export_crosstab_csv() is polling
     for it -- exactly what a real Playwright wait_for_timeout() call
-    would dispatch."""
+    would dispatch. No "download" event is simulated, so this also
+    covers the response.body() fallback path when Chrome never claims
+    the response as a native download."""
+    import src.exportbot.browser_crosstab as bc
+
+    monkeypatch.setattr(bc, "DOWNLOAD_EVENT_GRACE_PERIOD_MS", 10)
     download_btn = FakeLocator()
     data_item = FakeLocator()
     full_data_tab = FakeLocator()
@@ -888,12 +953,15 @@ def test_export_crosstab_csv_raises_when_tempfile_export_never_observed(tmp_path
         _export_crosstab_csv(page, tmp_path)
 
 
-def test_export_crosstab_csv_never_prints_secrets_around_tempfile_capture(tmp_path, capsys):
+def test_export_crosstab_csv_never_prints_secrets_around_tempfile_capture(tmp_path, capsys, monkeypatch):
     """The [NETDEBUG] lines fired by the diagnostic logger while waiting
     for the export must never print the real session id or result key --
     only _redact_url()-redacted URLs. This is what would have caught the
     real leak found earlier this session (the session id sits in the URL
     PATH, which _redact_url() did not originally strip)."""
+    import src.exportbot.browser_crosstab as bc
+
+    monkeypatch.setattr(bc, "DOWNLOAD_EVENT_GRACE_PERIOD_MS", 10)
     download_btn = FakeLocator()
     data_item = FakeLocator()
     full_data_tab = FakeLocator()
@@ -921,6 +989,46 @@ def test_export_crosstab_csv_never_prints_secrets_around_tempfile_capture(tmp_pa
     out = capsys.readouterr().out
     assert "SESSIONABC" not in out
     assert "KEY123" not in out
+
+
+def test_export_crosstab_csv_prefers_downloaded_bytes_over_response_body(tmp_path):
+    """Regression test for the real bug this session found: Chrome's own
+    native download handling can claim the tempfile response (visible in
+    the browser's own "Recent download history"), which makes
+    response.body() return the browser's raw download rather than
+    reliable CSV bytes -- and reproduces the exact symptom this fixes:
+    "it's downloading something, but not a csv file" (a bare GUID
+    filename). Simulates both the tempfile response AND a real
+    Playwright "download" event firing, as a live run showed happens,
+    and confirms the saved file's bytes and name come from the captured
+    download -- not the (deliberately different) response body, and not
+    the browser's meaningless GUID suggested_filename."""
+    download_btn = FakeLocator()
+    data_item = FakeLocator()
+    full_data_tab = FakeLocator()
+    view_data_download_btn = FakeLocator()
+    popup = ViewDataPopupPage(script=[full_data_tab, view_data_download_btn])
+    page = ScriptedPage(script=[download_btn, data_item], popup=popup)
+
+    downloaded_file = tmp_path / "chrome-temp-download"
+    downloaded_file.write_bytes(b"Product,Region\nWidget,East\n")
+    download = FakeDownload(path=str(downloaded_file), suggested_filename="91851309-e8b0-45df-a3d1-510f5503d937")
+
+    tempfile_response = FakeAPIResponse(
+        url=TEMPFILE_URL, headers={"content-type": "text/csv"}, body=b"WRONG IF THIS WERE ACTUALLY READ"
+    )
+
+    def _fire_tempfile_response_and_download_on_poll_tick(*args, **kwargs):
+        popup.fire("response", tempfile_response)
+        page.context.fire("download", download)
+
+    popup.wait_for_timeout = MagicMock(side_effect=_fire_tempfile_response_and_download_on_poll_tick)
+
+    result = _export_crosstab_csv(page, tmp_path / "export")
+
+    assert result.read_bytes() == b"Product,Region\nWidget,East\n"
+    assert result.name.startswith("ReturnRotate_")  # the GUID suggested_filename is rejected
+    assert result.suffix == ".csv"
 
 
 class DelayedViewDataPopupPage:
@@ -1126,6 +1234,92 @@ def test_save_tempfile_response_reports_a_clear_error_when_body_read_fails(tmp_p
     response = UnreadableBodyResponse(url=TEMPFILE_URL)
     with pytest.raises(BrowserAutomationError, match="could not read its body"):
         _save_tempfile_response(response, tmp_path)
+
+
+class FakeDownload:
+    """Fake for a Playwright Download object -- `.path()` returns a local
+    file (Chrome's own completed download), `.suggested_filename` is
+    whatever name the browser proposed (a real-server run showed this
+    can be a bare GUID with no extension at all)."""
+
+    def __init__(self, path, suggested_filename="download", path_raises=False):
+        self._path = path
+        self.suggested_filename = suggested_filename
+        self._path_raises = path_raises
+
+    def path(self):
+        if self._path_raises:
+            raise RuntimeError("download failed")
+        return self._path
+
+
+def test_save_tempfile_response_prefers_download_bytes_over_response_body(tmp_path):
+    """Regression test for the real bug: once Chrome's own native
+    download handling claims the tempfile response, response.body() can
+    return the wrong (or no) bytes. When a Download was captured, its
+    saved file -- not the response body -- must be the source of
+    truth."""
+    downloaded_file = tmp_path / "chrome-temp-download"
+    downloaded_file.write_bytes(b"Product,Region\nWidget,East\n")
+    download = FakeDownload(path=str(downloaded_file))
+
+    response = FakeAPIResponse(
+        url=TEMPFILE_URL,
+        headers={"content-type": "text/csv"},
+        body=b"THIS WOULD BE WRONG IF ACTUALLY READ",
+    )
+
+    result = _save_tempfile_response(response, tmp_path / "export", download=download)
+
+    assert result.read_bytes() == b"Product,Region\nWidget,East\n"
+
+
+def test_save_tempfile_response_ignores_download_suggested_filename_without_csv_extension(tmp_path):
+    """A real-server run showed the browser's suggested_filename can be a
+    bare GUID with no extension -- that must not be used verbatim; a
+    generated `.csv`-suffixed name is used instead. This is the exact
+    "downloaded something, but not a csv file" symptom being fixed."""
+    downloaded_file = tmp_path / "chrome-temp-download"
+    downloaded_file.write_bytes(b"a,b\n1,2\n")
+    download = FakeDownload(path=str(downloaded_file), suggested_filename="91851309-e8b0-45df-a3d1-510f5503d937")
+
+    response = FakeAPIResponse(url=TEMPFILE_URL, headers={"content-type": "text/csv"})  # no content-disposition
+
+    result = _save_tempfile_response(response, tmp_path / "export", download=download)
+
+    assert result.name.startswith("ReturnRotate_")
+    assert result.suffix == ".csv"
+
+
+def test_save_tempfile_response_uses_download_suggested_filename_when_it_has_csv_extension(tmp_path):
+    downloaded_file = tmp_path / "chrome-temp-download"
+    downloaded_file.write_bytes(b"a,b\n1,2\n")
+    download = FakeDownload(path=str(downloaded_file), suggested_filename="Persentase Nasional_data.csv")
+
+    response = FakeAPIResponse(url=TEMPFILE_URL, headers={"content-type": "text/csv"})
+
+    result = _save_tempfile_response(response, tmp_path / "export", download=download)
+
+    assert result.name == "Persentase Nasional_data.csv"
+
+
+def test_save_tempfile_response_rejects_empty_download(tmp_path):
+    downloaded_file = tmp_path / "chrome-temp-download"
+    downloaded_file.write_bytes(b"")
+    download = FakeDownload(path=str(downloaded_file))
+
+    response = FakeAPIResponse(url=TEMPFILE_URL, headers={"content-type": "text/csv"})
+
+    with pytest.raises(BrowserAutomationError, match="empty"):
+        _save_tempfile_response(response, tmp_path, download=download)
+
+
+def test_save_tempfile_response_reports_clear_error_when_download_path_fails(tmp_path):
+    download = FakeDownload(path=None, path_raises=True)
+    response = FakeAPIResponse(url=TEMPFILE_URL, headers={"content-type": "text/csv"})
+
+    with pytest.raises(BrowserAutomationError, match="could not read its saved file"):
+        _save_tempfile_response(response, tmp_path, download=download)
 
 
 class ReadinessLocator:
