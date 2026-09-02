@@ -535,6 +535,112 @@ should be corrected to target it precisely, and the debug instrumentation
 `_FRAME_INSPECTION_SCRIPT`, `_inspect_frame`, `_debug_dump_view_data_popup`
 itself, and its call site in `_export_crosstab_csv`) removed.
 
+### Network-based export -- pivot away from the popup's DOM entirely
+
+**A user ran the extended frame/shadow-DOM/canvas/context-page diagnostic
+against the real server and got a conclusive answer: the "View Data"
+popup is only a thin wrapper.** `popup.frames` had exactly 1 entry (the
+same hybrid-window URL as the popup itself, not a distinct nested
+document), that single frame's `body_inner_html_length` was 931 but
+`body_inner_text` was empty, and it had zero visible buttons, zero
+"Download"-text matches, zero nested iframes, zero open shadow roots,
+and zero canvas elements. The browser context had exactly 2 pages: the
+main Tableau dashboard and this popup -- no third, hidden page hosting
+the real UI either. In short: there is no DOM control anywhere in this
+popup to click, on any real level (top document, nested frame, shadow
+DOM, canvas, or a sibling page) -- confirming this popup is a
+"communication shell" (its own title, "Hybrid Popup Window", already
+hinted at this), not a rendered dialog.
+
+Continuing to search for a DOM locator was therefore abandoned in favor
+of the one thing already known to be real and reproducible: the HAR
+capture of the actual "Download -> Crosstab" flow (see "Native UI
+Crosstab download" above), whose last two steps are a VizQL command
+(`.../commands/tabsrv/export-view-data-summary-to-csv-server`) and a GET
+to a `.../tempfile/sessions/{id}?key={resultKey}&keepfile=yes&attachment=yes`
+URL that returns the actual CSV (`Content-Type: text/csv`,
+`Content-Disposition: attachment`). Whatever triggers that VizQL command
+in the real UI, the tempfile response is the one network event that
+reliably signals "the export happened" -- so `_export_from_view_data_popup()`
+was rewritten around capturing it directly, instead of a DOM click ->
+`page.expect_download()` flow:
+
+1. `_attach_export_network_diagnostics()` attaches request/response
+   listeners (`_log_export_request()` / `_log_export_response()`) to
+   both the main dashboard page and the popup page. Playwright's
+   page-level request/response events also bubble to the shared browser
+   context, so attaching to either page observes traffic from both --
+   this is still done explicitly on both pages for clarity and so the
+   `[NETDEBUG]` log lines are attributable. Only requests/responses whose
+   URL contains `export-view-data-summary-to-csv-server` or
+   `/tempfile/` are logged (method, status, Content-Type, and the
+   `_redact_url()`-redacted URL) -- never headers beyond Content-Type,
+   never bodies, and every accessor is wrapped so a broken listener can
+   never break the real export attempt.
+2. A click target is still searched for -- not because the popup's DOM
+   has one (it doesn't), but because *something* must trigger the VizQL
+   export command, and the only non-speculative candidate available is
+   the existing `VIEW_DATA_DOWNLOAD_BUTTON_CANDIDATES` list. Rather than
+   invent a new locator (explicitly ruled out), `_find_first_with_wait_across_pages()`
+   searches that same list against both the popup and the main dashboard
+   page together, on one shared deadline -- covering the hypothesis that
+   the main page, not this popup, owns the real View Data UI and the
+   popup is only a target window for the eventual download. If neither
+   page has a match, this raises `BrowserAutomationError` rather than
+   guessing further, pointing at the `[NETDEBUG]` log for whatever
+   traffic (if any) was actually observed.
+3. The eventual click is wrapped in
+   `view_data_page.context.expect_event("response", predicate=...)`
+   matching `/tempfile/`, waited at the **browser context** level (not
+   a specific page) so it's caught regardless of which of the two pages
+   the request actually originates from -- addressing directly whether
+   the existing "Exporting Crosstab..." step could wait for this response
+   instead of Playwright's `download` event: yes, and this is more
+   robust, since a fetch/blob-based export may never raise Playwright's
+   `download` event at all even on success, while the tempfile HTTP
+   response fires either way.
+4. `_save_tempfile_response()` reads that response directly (`response.body()`),
+   verifies its status is not an error and its Content-Type contains
+   "csv" or "text" before writing anything (refusing to save anything
+   else), and picks a filename from the response's own
+   `Content-Disposition` header when present (parsed by
+   `_extract_filename_from_content_disposition()`, matching both the
+   plain and RFC 5987 forms) -- sanitized by `_sanitize_filename()`
+   (bare basename only, hostile characters replaced) before ever being
+   joined onto `EXPORT_DIR`, since that header value is server-supplied
+   and must never be trusted as a path. Falls back to the existing
+   generated `ReturnRotate_<timestamp>.csv` name when no usable
+   `Content-Disposition` is present.
+
+The `_debug_dump_view_data_popup()` DOM diagnostic from the previous
+round is kept in place per explicit instruction, even though the
+real-server run already answered the question it was built to answer --
+it's cheap, still runs before the network-based export attempt, and
+would still be useful if a future Tableau update changes this behavior.
+No fixed sleeps were added anywhere in this flow. Login/dashboard
+navigation and popup detection (`page.expect_popup()`) are unchanged.
+
+Regression tests (`tests/test_browser_crosstab.py`) cover: `_is_export_related_url()`
+matching exactly the two HAR-confirmed URL fragments and nothing else;
+`_extract_filename_from_content_disposition()` (plain and RFC 5987
+forms, absent header); `_sanitize_filename()` (path components and
+hostile characters stripped, empty/unusable input returns `None`);
+`_save_tempfile_response()` (Content-Disposition-derived filename,
+fallback to a generated name, rejecting a non-CSV/text Content-Type,
+rejecting an HTTP error status); `_attach_export_network_diagnostics()`
+(registers both listeners, never raises when `.on()` itself fails);
+`_find_first_with_wait_across_pages()` (finds a match on either page
+sharing one deadline, returns `None` on timeout); and the rewritten
+`_export_from_view_data_popup()` end-to-end (overlay-wait-before-click
+preserved, tempfile response captured and saved, timeout when no
+tempfile response ever arrives, `BrowserAutomationError` when neither
+page has a click target, and the click target found on the main page
+instead of the popup). **This rewrite has not yet been run against the
+real server** -- the next real run is what will show whether the
+existing `VIEW_DATA_DOWNLOAD_BUTTON_CANDIDATES` locator actually matches
+something clickable on either page (main or popup) in practice; the
+`[NETDEBUG]` log lines from that run are the next thing to share back.
+
 ## What is tested vs. not
 
 Tested in this environment (`pytest`, no network):
@@ -600,21 +706,34 @@ Tested in this environment (`pytest`, no network):
   `_wait_for_dashboard()` (success + timeout), `_export_crosstab_csv()`
   (Download -> Data click sequence, catching the "View Data" popup via a
   fake `expect_popup()`, the popup-never-opens error path, and
-  debug-screenshot-on-failure), `_export_from_view_data_popup()` (the
-  popup's own Download button click through to `download.save_as()` with
-  the correct timestamped filename, plus the overlay-wait-before-click
-  regression cases -- overlays clearing normally, a stuck overlay, and a
-  missing button -- each producing a clean `BrowserAutomationError`
-  instead of a raw Playwright traceback), `_redact_url()` (sensitive
-  query-parameter values redacted, non-sensitive ones preserved, never
-  raises on unparseable input), `_inspect_frame()` (returns a frame's
-  `evaluate()` result normally, or `{"error": ...}` without raising when
-  `evaluate()` throws), `_debug_dump_view_data_popup()` (temporary
-  debug-only instrumentation: prints URL/title, per-frame DOM diagnostics
-  -- buttons, Download-text matches, iframes, shadow roots, canvases --
-  and other browser-context pages, with URLs redacted, saves a
-  screenshot, all independently try/excepted so any single failure here
-  is reported but never blocks the real export), and
+  debug-screenshot-on-failure), `_export_from_view_data_popup()` --
+  rewritten around network capture (see "Network-based export" above):
+  the overlay-wait-before-click regression cases (overlays clearing
+  normally, a stuck overlay), the tempfile network response being
+  captured and saved, a timeout when no tempfile response ever arrives,
+  raising when neither the popup nor the main dashboard page has a
+  matching click target, and finding the click target on the main page
+  when the popup has none -- each of the failure cases producing a clean
+  `BrowserAutomationError` instead of a raw Playwright traceback,
+  `_is_export_related_url()` (matches only the two HAR-confirmed URL
+  fragments), `_extract_filename_from_content_disposition()` (plain and
+  RFC 5987 forms, absent header), `_sanitize_filename()` (strips path
+  components and hostile characters, returns `None` for unusable input),
+  `_save_tempfile_response()` (Content-Disposition-derived filename,
+  fallback to a generated name, rejects a non-CSV/text Content-Type,
+  rejects an HTTP error status), `_attach_export_network_diagnostics()`
+  (registers both listeners, never raises when `.on()` fails),
+  `_find_first_with_wait_across_pages()` (finds a match on either page
+  sharing one deadline, returns `None` on timeout), `_redact_url()`
+  (sensitive query-parameter values redacted, non-sensitive ones
+  preserved, never raises on unparseable input), `_inspect_frame()`
+  (returns a frame's `evaluate()` result normally, or `{"error": ...}`
+  without raising when `evaluate()` throws), `_debug_dump_view_data_popup()`
+  (temporary debug-only instrumentation: prints URL/title, per-frame DOM
+  diagnostics -- buttons, Download-text matches, iframes, shadow roots,
+  canvases -- and other browser-context pages, with URLs redacted, saves
+  a screenshot, all independently try/excepted so any single failure
+  here is reported but never blocks the real export), and
   `run_browser_crosstab_export()`'s orchestration (goto
   order, browser launch args, browser always closed), all using
   hand-built fake
@@ -630,8 +749,12 @@ automation" above for exactly why):
   live dashboard's real markup — entirely unverified; they're
   best-effort accessible-role/name guesses, not confirmed by inspection.
 - Whether the login form is detected/filled correctly on the real page.
-- Whether Download -> Data -> Crosstab actually triggers a download the
-  way `page.expect_download()` expects.
+- Whether the rewritten network-based export (see "Network-based
+  export" above) actually works end to end: whether either page has a
+  clickable `VIEW_DATA_DOWNLOAD_BUTTON_CANDIDATES` match at all, whether
+  clicking it triggers the real `export-view-data-summary-to-csv-server`
+  VizQL command, and whether the resulting `.../tempfile/...` response is
+  observed and captured correctly.
 
 Not tested, requires a machine with access to `insight.erajaya.com`:
 - `discover_api_version()` against the real `serverinfo` endpoint (a user

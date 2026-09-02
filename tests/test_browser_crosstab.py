@@ -15,13 +15,19 @@ import pytest
 
 from src.exportbot.browser_crosstab import (
     OVERLAY_SELECTORS,
+    _attach_export_network_diagnostics,
     _debug_dump_view_data_popup,
     _export_crosstab_csv,
     _export_from_view_data_popup,
+    _extract_filename_from_content_disposition,
     _find_first,
+    _find_first_with_wait_across_pages,
     _inspect_frame,
+    _is_export_related_url,
     _login_if_needed,
     _redact_url,
+    _sanitize_filename,
+    _save_tempfile_response,
     _wait_for_dashboard,
     generate_export_filename,
     resolve_executable_path,
@@ -46,19 +52,53 @@ class FakeLocator:
         return self
 
 
-class _DownloadCM:
-    def __init__(self, download):
-        self._download = download
+class FakeResponse:
+    """Fake for a Playwright Response -- stands in for the HAR-confirmed
+    `.../tempfile/...` response that now carries the actual export
+    (a real-server diagnostic showed the "View Data" popup's own DOM has
+    no clickable Download button, so the export is captured over the
+    network instead -- see _save_tempfile_response())."""
+
+    def __init__(self, url, status=200, headers=None, body=b"Product,Region\nWidget,East\n"):
+        self.url = url
+        self.status = status
+        self.headers = headers if headers is not None else {"content-type": "text/csv"}
+        self._body = body
+
+    def body(self):
+        return self._body
+
+
+class _ResponseEventCM:
+    """Mirrors BrowserContext.expect_event("response", ...): resolves (or
+    times out) when the `with` block exits, matching Playwright's actual
+    behavior for expect_* context managers."""
+
+    def __init__(self, response):
+        self._response = response
 
     def __enter__(self):
         return self
 
-    def __exit__(self, *args):
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is None and self._response is None:
+            raise TimeoutError("Timeout waiting for response event")
         return False
 
     @property
     def value(self):
-        return self._download
+        return self._response
+
+
+class FakeExportContext:
+    """Fake for a BrowserContext, exposing only the one method
+    _export_from_view_data_popup() actually calls on it."""
+
+    def __init__(self, response=None):
+        self._response = response
+
+    def expect_event(self, event_name, predicate=None, timeout=None):
+        return _ResponseEventCM(self._response)
 
 
 class _PopupCM:
@@ -83,27 +123,22 @@ class _PopupCM:
         return self._popup
 
 
-class FakeDownload:
-    def __init__(self):
-        self.save_as = MagicMock()
-
-
 class ScriptedPage:
     """Returns pre-scripted FakeLocators in call order, regardless of
     which get_by_*/locator method is used -- lets tests control exactly
     which candidate in an ordered fallback list "matches" without
     simulating real DOM text matching."""
 
-    def __init__(self, script, download=None, popup=None):
+    def __init__(self, script, popup=None):
         self._script = list(script)
         self._pos = 0
         self.frames = []
-        self._download = download
         self._popup = popup
         self.wait_for_timeout = MagicMock()
         self.wait_for_load_state = MagicMock()
         self.goto = MagicMock()
         self.screenshot = MagicMock()
+        self.on = MagicMock()
 
     def _next(self, *args, **kwargs):
         if self._pos >= len(self._script):
@@ -124,22 +159,30 @@ class ScriptedPage:
     def locator(self, *args, **kwargs):
         return self._next()
 
-    def expect_download(self, timeout=None):
-        return _DownloadCM(self._download)
-
     def expect_popup(self, timeout=None):
         return _PopupCM(self._popup)
 
 
 class ViewDataPopupPage:
-    """Fake for the "View Data" popup window opened by Download -> Data:
-    provides its own Download button (findable via get_by_role, matching
-    VIEW_DATA_DOWNLOAD_BUTTON_CANDIDATES' first candidate), plus
-    dedicated, independently-controllable overlay locators for each
-    selector in OVERLAY_SELECTORS -- reachable only via .locator(), never
-    consumed by the role-based button lookup."""
+    """Fake for the "View Data" popup window opened by Download -> Data.
 
-    def __init__(self, overlay_wait_side_effect=None, download=None, button_present=True):
+    A real-server diagnostic showed this popup's own DOM has zero visible
+    buttons at all, so the export is now driven via network capture
+    (context.expect_event("response", ...)) instead of a click ->
+    expect_download flow -- see _export_from_view_data_popup(). This fake
+    still exposes a findable button (VIEW_DATA_DOWNLOAD_BUTTON_CANDIDATES'
+    first candidate) since the code still needs *something* to click to
+    trigger the export command, plus a `.context` whose `expect_event()`
+    resolves with `tempfile_response` (a FakeResponse) once that click
+    happens, mirroring how the real tempfile GET fires after the real
+    Download control is clicked."""
+
+    def __init__(
+        self,
+        overlay_wait_side_effect=None,
+        tempfile_response=None,
+        button_present=True,
+    ):
         self.frames = []
         self.url = "https://insight.example.com/vizql/v_test/hybrid-window/min/index.html"
         self.download_button = FakeLocator(present=button_present)
@@ -147,7 +190,8 @@ class ViewDataPopupPage:
         self.wait_for_load_state = MagicMock()
         self.goto = MagicMock()
         self.screenshot = MagicMock()
-        self._download = download
+        self.on = MagicMock()
+        self.context = FakeExportContext(response=tempfile_response)
 
         def _title():
             return "View Data: Test Sheet"
@@ -177,9 +221,6 @@ class ViewDataPopupPage:
         if selector in self.overlay_locators:
             return self.overlay_locators[selector]
         return FakeLocator(present=False)
-
-    def expect_download(self, timeout=None):
-        return _DownloadCM(self._download)
 
 
 def test_redact_url_redacts_sensitive_params_but_keeps_others():
@@ -527,16 +568,21 @@ def test_wait_for_dashboard_raises_on_timeout(monkeypatch):
         _wait_for_dashboard(page)
 
 
-def test_export_crosstab_csv_full_flow_saves_file_via_popup(tmp_path):
+def test_export_crosstab_csv_full_flow_saves_file_via_network_response(tmp_path):
     """End-to-end through both _export_crosstab_csv() and
     _export_from_view_data_popup(): clicking Download -> Data opens a
-    separate "View Data" popup page, and the actual CSV export happens
-    entirely within it -- confirmed via a real local run and screenshot,
-    not the old (incorrect) assumption of an in-page Crosstab tab."""
+    separate "View Data" popup page, and the actual CSV export is now
+    captured via the HAR-confirmed tempfile network response rather than
+    a DOM download button or Playwright's `download` event -- a
+    real-server diagnostic found the popup's own DOM has zero buttons at
+    all (see CLAUDE.md, "Network-based export")."""
     download_btn = FakeLocator()
     data_item = FakeLocator()
-    download = FakeDownload()
-    popup = ViewDataPopupPage(download=download)
+    tempfile_response = FakeResponse(
+        url="https://insight.example.com/vizql/w_test/v_test/tempfile/sessions/abc?key=xyz",
+        body=b"Product,Region\nWidget,East\n",
+    )
+    popup = ViewDataPopupPage(tempfile_response=tempfile_response)
     page = ScriptedPage(script=[download_btn, data_item], popup=popup)
 
     result = _export_crosstab_csv(page, tmp_path)
@@ -544,13 +590,10 @@ def test_export_crosstab_csv_full_flow_saves_file_via_popup(tmp_path):
     download_btn.click.assert_called_once()
     data_item.click.assert_called_once()
     popup.download_button.click.assert_called_once()
-    download.save_as.assert_called_once()
 
-    saved_path = download.save_as.call_args.args[0]
-    assert saved_path.startswith(str(tmp_path))
-    assert saved_path.endswith(".csv")
-    assert "ReturnRotate_" in saved_path
-    assert result == tmp_path / Path(saved_path).name
+    assert result.parent == tmp_path
+    assert result.name.startswith("ReturnRotate_")
+    assert result.read_bytes() == b"Product,Region\nWidget,East\n"
 
 
 def test_export_crosstab_csv_raises_and_screenshots_when_download_button_missing(tmp_path):
@@ -587,18 +630,21 @@ def test_export_from_view_data_popup_waits_for_overlays_before_click(tmp_path):
     intercepts pointer events, so Playwright's click() retries and times
     out. The fix must explicitly wait for each known overlay to clear
     (via Locator.wait_for(state="hidden")) before attempting the click."""
-    download = FakeDownload()
-    popup = ViewDataPopupPage(download=download)  # overlays resolve immediately (default MagicMock)
+    tempfile_response = FakeResponse(
+        url="https://insight.example.com/vizql/tempfile/sessions/abc?key=xyz"
+    )
+    popup = ViewDataPopupPage(tempfile_response=tempfile_response)  # overlays resolve immediately
+    page = ScriptedPage(script=[])
 
-    result = _export_from_view_data_popup(popup, tmp_path)
+    result = _export_from_view_data_popup(page, popup, tmp_path)
 
     for selector in OVERLAY_SELECTORS:
         popup.overlay_locators[selector].wait_for.assert_called_once_with(
             state="hidden", timeout=30_000
         )
     popup.download_button.click.assert_called_once()
-    download.save_as.assert_called_once()
     assert result.name.startswith("ReturnRotate_")
+    assert result.read_bytes() == b"Product,Region\nWidget,East\n"
 
 
 def test_export_from_view_data_popup_raises_and_screenshots_when_overlay_never_clears(tmp_path):
@@ -611,23 +657,195 @@ def test_export_from_view_data_popup_raises_and_screenshots_when_overlay_never_c
         raise TimeoutError("Timeout 30000ms exceeded waiting for element to be hidden")
 
     popup = ViewDataPopupPage(overlay_wait_side_effect=always_times_out)
+    page = ScriptedPage(script=[])
 
     with pytest.raises(BrowserAutomationError, match="Could not export CSV from the View Data window"):
-        _export_from_view_data_popup(popup, tmp_path)
+        _export_from_view_data_popup(page, popup, tmp_path)
 
     popup.download_button.click.assert_not_called()
     popup.screenshot.assert_called_once()
 
 
-def test_export_from_view_data_popup_raises_when_download_button_missing(monkeypatch, tmp_path):
+def test_export_from_view_data_popup_raises_when_tempfile_response_never_observed(tmp_path):
+    """If the click happens but no matching tempfile response ever fires
+    (e.g. the export command failed silently, or the trigger wasn't
+    actually the right control), the network wait must time out into a
+    clear BrowserAutomationError rather than hanging or reporting false
+    success."""
+    popup = ViewDataPopupPage(tempfile_response=None)
+    page = ScriptedPage(script=[])
+
+    with pytest.raises(BrowserAutomationError, match="Could not export CSV from the View Data window"):
+        _export_from_view_data_popup(page, popup, tmp_path)
+
+    popup.download_button.click.assert_called_once()
+    popup.screenshot.assert_called_once()
+
+
+def test_export_from_view_data_popup_raises_when_no_download_control_on_either_page(monkeypatch, tmp_path):
+    """A real-server diagnostic showed the popup's own DOM has no
+    Download control at all, so the search now also covers the main
+    dashboard page (the "parent page owns the real UI" hypothesis). If
+    neither page has a match, this must raise rather than guess a new
+    selector."""
     import src.exportbot.browser_crosstab as bc
 
     monkeypatch.setattr(bc, "DASHBOARD_LOAD_TIMEOUT_MS", 10)
     popup = ViewDataPopupPage(button_present=False)
+    page = ScriptedPage(script=[])  # main page also has no matching control
 
-    with pytest.raises(BrowserAutomationError, match='"Download" button in the View Data window'):
-        _export_from_view_data_popup(popup, tmp_path)
+    with pytest.raises(BrowserAutomationError, match='"Download" control'):
+        _export_from_view_data_popup(page, popup, tmp_path)
     popup.screenshot.assert_called_once()
+
+
+def test_export_from_view_data_popup_finds_download_control_on_main_page(monkeypatch, tmp_path):
+    """Covers the "parent page owns the real UI" hypothesis directly: the
+    popup has no matching control, but the main dashboard page does --
+    the broadened, shared-deadline search must find and click it there."""
+    import src.exportbot.browser_crosstab as bc
+
+    monkeypatch.setattr(bc, "DASHBOARD_LOAD_TIMEOUT_MS", 10)
+    tempfile_response = FakeResponse(
+        url="https://insight.example.com/vizql/tempfile/sessions/abc?key=xyz"
+    )
+    popup = ViewDataPopupPage(tempfile_response=tempfile_response, button_present=False)
+    main_page_button = FakeLocator()
+    page = ScriptedPage(script=[main_page_button])
+
+    result = _export_from_view_data_popup(page, popup, tmp_path)
+
+    main_page_button.click.assert_called_once()
+    popup.download_button.click.assert_not_called()
+    assert result.name.startswith("ReturnRotate_")
+
+
+def test_is_export_related_url_matches_command_and_tempfile_only():
+    assert _is_export_related_url(
+        "https://insight.example.com/vizql/w/x/v/y/sessions/1/commands/tabsrv/export-view-data-summary-to-csv-server"
+    )
+    assert _is_export_related_url(
+        "https://insight.example.com/vizql/w/x/v/y/tempfile/sessions/1?key=abc"
+    )
+    assert not _is_export_related_url("https://insight.example.com/vizql/w/x/v/y/commands/tabdoc/launch-hybrid-view-data-dialog")
+
+
+def test_extract_filename_from_content_disposition_plain():
+    assert (
+        _extract_filename_from_content_disposition('attachment; filename="Persentase Nasional_data.csv"')
+        == "Persentase Nasional_data.csv"
+    )
+
+
+def test_extract_filename_from_content_disposition_rfc5987():
+    assert (
+        _extract_filename_from_content_disposition("attachment; filename*=UTF-8''Persentase%20Nasional_data.csv")
+        == "Persentase%20Nasional_data.csv"
+    )
+
+
+def test_extract_filename_from_content_disposition_none_when_absent():
+    assert _extract_filename_from_content_disposition(None) is None
+    assert _extract_filename_from_content_disposition("attachment") is None
+
+
+def test_sanitize_filename_strips_path_components_and_hostile_characters():
+    assert _sanitize_filename("../../etc/passwd") == "passwd"
+    assert _sanitize_filename("..\\..\\Windows\\evil.csv") == "evil.csv"
+    assert _sanitize_filename('weird"name?.csv') == "weird_name_.csv"
+
+
+def test_sanitize_filename_returns_none_for_empty_or_missing():
+    assert _sanitize_filename(None) is None
+    assert _sanitize_filename("") is None
+    assert _sanitize_filename("../") is None
+
+
+def test_save_tempfile_response_uses_content_disposition_filename(tmp_path):
+    response = FakeResponse(
+        url="https://insight.example.com/vizql/tempfile/sessions/1?key=abc",
+        headers={"content-type": "text/csv", "content-disposition": 'attachment; filename="Persentase Nasional_data.csv"'},
+        body=b"a,b\n1,2\n",
+    )
+    path = _save_tempfile_response(response, tmp_path)
+    assert path == tmp_path / "Persentase Nasional_data.csv"
+    assert path.read_bytes() == b"a,b\n1,2\n"
+
+
+def test_save_tempfile_response_falls_back_to_generated_filename_without_disposition(tmp_path):
+    response = FakeResponse(
+        url="https://insight.example.com/vizql/tempfile/sessions/1?key=abc",
+        headers={"content-type": "text/csv"},
+    )
+    path = _save_tempfile_response(response, tmp_path)
+    assert path.parent == tmp_path
+    assert path.name.startswith("ReturnRotate_")
+    assert path.name.endswith(".csv")
+
+
+def test_save_tempfile_response_rejects_non_csv_content_type(tmp_path):
+    response = FakeResponse(
+        url="https://insight.example.com/vizql/tempfile/sessions/1?key=abc",
+        headers={"content-type": "application/json"},
+    )
+    with pytest.raises(BrowserAutomationError, match="Content-Type"):
+        _save_tempfile_response(response, tmp_path)
+
+
+def test_save_tempfile_response_rejects_error_status(tmp_path):
+    response = FakeResponse(
+        url="https://insight.example.com/vizql/tempfile/sessions/1?key=abc",
+        status=404,
+    )
+    with pytest.raises(BrowserAutomationError, match="HTTP 404"):
+        _save_tempfile_response(response, tmp_path)
+
+
+class FakeNetworkPage:
+    """Minimal fake exposing only .on(), used to test
+    _attach_export_network_diagnostics() in isolation."""
+
+    def __init__(self, on_raises=False):
+        self.registered = []
+        self._on_raises = on_raises
+
+    def on(self, event, handler):
+        if self._on_raises:
+            raise RuntimeError("on() failed")
+        self.registered.append((event, handler))
+
+
+def test_attach_export_network_diagnostics_registers_request_and_response_handlers():
+    page = FakeNetworkPage()
+    _attach_export_network_diagnostics([page])
+    events = [event for event, _handler in page.registered]
+    assert events == ["request", "response"]
+
+
+def test_attach_export_network_diagnostics_never_raises_when_on_fails():
+    page = FakeNetworkPage(on_raises=True)
+    _attach_export_network_diagnostics([page])  # must not raise
+
+
+def test_find_first_with_wait_across_pages_checks_both_pages_before_timing_out():
+    absent_a = FakeLocator(present=False)
+    absent_b = FakeLocator(present=False)
+    present = FakeLocator()
+    page_a = ScriptedPage(script=[absent_a])
+    page_b = ScriptedPage(script=[absent_b, present])
+
+    result = _find_first_with_wait_across_pages([page_a, page_b], [lambda s: s.get_by_role("button")], 1_000)
+
+    assert result is present
+
+
+def test_find_first_with_wait_across_pages_returns_none_on_timeout():
+    page_a = ScriptedPage(script=[])
+    page_b = ScriptedPage(script=[])
+
+    result = _find_first_with_wait_across_pages([page_a, page_b], [lambda s: s.get_by_role("button")], 10)
+
+    assert result is None
 
 
 def test_run_browser_crosstab_export_orchestrates_and_closes_browser(tmp_path):
