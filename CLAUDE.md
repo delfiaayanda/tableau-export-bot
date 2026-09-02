@@ -451,6 +451,27 @@ and never clearing), and the popup's Download button being missing.
 exact popup shape from the screenshot, but whether the click actually
 completes the download has not been confirmed yet.
 
+**A user then confirmed the popup detection itself works**
+(`Opening Data...` / `Exporting Crosstab...` printed correctly) but hit
+`Could not find the "Download" button in the View Data window.` --
+`VIEW_DATA_DOWNLOAD_BUTTON_CANDIDATES` was reused verbatim from the main
+dashboard's toolbar without any confirmation it matches the popup's DOM,
+and it doesn't. Rather than guess a second time, `_debug_dump_view_data_popup()`
+was added (called unconditionally, right after the popup loads, before
+`_export_from_view_data_popup()`) as **temporary debug-only
+instrumentation** -- it prints the popup's URL/title, every visible
+button's `inner_text`/`aria-label`/`role`/`data-tb-test-id`/`title`,
+every visible element whose text matches `/download/i`, a screenshot at
+`<EXPORT_DIR>/debug_view_data_popup.png`, and the outerHTML of the first
+Download-text match plus its parent/grandparent (all via
+`Page.evaluate()`, reading only visible UI text/attributes -- never
+credentials, cookies, or tokens). Every step is independently
+try/excepted so a diagnostic failure never blocks the real export
+attempt that follows. **Not yet run against the real server** -- this is
+the very diagnostic meant to produce that data; once its output is
+shared back, `VIEW_DATA_DOWNLOAD_BUTTON_CANDIDATES` should be corrected
+to match and `_debug_dump_view_data_popup()` (and its call site) removed.
+
 ## What is tested vs. not
 
 Tested in this environment (`pytest`, no network):
@@ -521,9 +542,13 @@ Tested in this environment (`pytest`, no network):
   the correct timestamped filename, plus the overlay-wait-before-click
   regression cases -- overlays clearing normally, a stuck overlay, and a
   missing button -- each producing a clean `BrowserAutomationError`
-  instead of a raw Playwright traceback), and
-  `run_browser_crosstab_export()`'s orchestration (goto order, browser
-  launch args, browser always closed), all using hand-built fake
+  instead of a raw Playwright traceback), `_debug_dump_view_data_popup()`
+  (temporary debug-only instrumentation: prints URL/title/buttons/
+  Download-text matches, saves a screenshot, all independently
+  try/excepted so any failure here is reported but never blocks the real
+  export), and `run_browser_crosstab_export()`'s orchestration (goto
+  order, browser launch args, browser always closed), all using
+  hand-built fake
   Playwright-like objects -- no real browser, no real Tableau DOM.
 - `browser_crosstab.py` (CLI) — config-error/success/failure reporting,
   mocking the export function entirely; confirms credentials never

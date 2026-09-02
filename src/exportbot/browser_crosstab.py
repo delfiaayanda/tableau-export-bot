@@ -263,8 +263,110 @@ def _export_crosstab_csv(page, export_dir: Path):
         _save_debug_screenshot(page, export_dir, "view-data-popup-not-opened")
         raise BrowserAutomationError(f"The 'View Data' popup window did not open: {exc}") from exc
 
+    # --- TEMPORARY DEBUG ONLY -- remove once the real Download control in
+    # the "View Data" popup is confirmed and VIEW_DATA_DOWNLOAD_BUTTON_CANDIDATES
+    # is updated to match it. Never touches credentials/cookies/tokens.
+    _debug_dump_view_data_popup(view_data_page, export_dir)
+
     print("Exporting Crosstab...")
     return _export_from_view_data_popup(view_data_page, export_dir)
+
+
+def _debug_dump_view_data_popup(view_data_page, export_dir: Path) -> None:
+    """TEMPORARY DEBUG ONLY: dumps DOM diagnostics for the "View Data"
+    popup so its real Download control can be identified precisely
+    instead of guessed. Entirely best-effort -- every failure here is
+    caught and reported, never allowed to break the actual export
+    attempt that follows. Prints only visible UI text/attributes and
+    saves a screenshot; never touches credentials, cookies, or tokens."""
+    print(f"[DEBUG] popup.url = {view_data_page.url}")
+    try:
+        print(f"[DEBUG] popup.title() = {view_data_page.title()}")
+    except Exception as exc:
+        print(f"[DEBUG] popup.title() failed: {exc}")
+
+    try:
+        export_dir.mkdir(parents=True, exist_ok=True)
+        screenshot_path = export_dir / "debug_view_data_popup.png"
+        view_data_page.screenshot(path=str(screenshot_path))
+        print(f"[DEBUG] screenshot saved to {screenshot_path}")
+    except Exception as exc:
+        print(f"[DEBUG] screenshot failed: {exc}")
+
+    buttons_script = """
+() => Array.from(document.querySelectorAll('button, [role="button"], [role="menuitem"]'))
+    .filter(el => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length))
+    .map(el => ({
+        tag: el.tagName,
+        inner_text: (el.innerText || '').trim().slice(0, 80),
+        aria_label: el.getAttribute('aria-label'),
+        role: el.getAttribute('role'),
+        data_tb_test_id: el.getAttribute('data-tb-test-id'),
+        title: el.getAttribute('title'),
+    }))
+"""
+    try:
+        buttons = view_data_page.evaluate(buttons_script)
+    except Exception as exc:
+        buttons = []
+        print(f"[DEBUG] button enumeration failed: {exc}")
+
+    print(f"[DEBUG] visible buttons/menuitems ({len(buttons)}):")
+    for button in buttons:
+        print(f"[DEBUG]   {button}")
+
+    download_text_script = """
+() => Array.from(document.querySelectorAll('*'))
+    .filter(el => {
+        const text = (el.innerText || el.textContent || '');
+        return text && /download/i.test(text) && text.trim().length < 60
+            && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+    })
+    .slice(0, 20)
+    .map(el => ({
+        tag: el.tagName,
+        text: (el.innerText || el.textContent || '').trim().slice(0, 80),
+        aria_label: el.getAttribute('aria-label'),
+        title: el.getAttribute('title'),
+        data_tb_test_id: el.getAttribute('data-tb-test-id'),
+        class_name: el.className && el.className.toString ? el.className.toString().slice(0, 120) : String(el.className),
+    }))
+"""
+    try:
+        download_elements = view_data_page.evaluate(download_text_script)
+    except Exception as exc:
+        download_elements = []
+        print(f"[DEBUG] 'download' text element search failed: {exc}")
+
+    print(f"[DEBUG] elements containing 'Download' text ({len(download_elements)}):")
+    for element in download_elements:
+        print(f"[DEBUG]   {element}")
+
+    toolbar_html_script = """
+() => {
+    const candidates = Array.from(document.querySelectorAll('*')).filter(el => {
+        const text = (el.innerText || el.textContent || '');
+        return text && /download/i.test(text) && text.trim().length < 60
+            && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+    });
+    if (candidates.length === 0) return null;
+    const el = candidates[0];
+    const parent = el.parentElement;
+    const grandparent = parent ? parent.parentElement : null;
+    return {
+        element_html: el.outerHTML ? el.outerHTML.slice(0, 500) : null,
+        parent_html: parent && parent.outerHTML ? parent.outerHTML.slice(0, 1500) : null,
+        grandparent_html: grandparent && grandparent.outerHTML ? grandparent.outerHTML.slice(0, 2000) : null,
+    };
+}
+"""
+    try:
+        toolbar_html = view_data_page.evaluate(toolbar_html_script)
+    except Exception as exc:
+        toolbar_html = None
+        print(f"[DEBUG] toolbar HTML dump failed: {exc}")
+
+    print(f"[DEBUG] toolbar HTML around first 'Download' match: {toolbar_html}")
 
 
 def _export_from_view_data_popup(view_data_page, export_dir: Path) -> Path:

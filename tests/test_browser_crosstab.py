@@ -15,6 +15,7 @@ import pytest
 
 from src.exportbot.browser_crosstab import (
     OVERLAY_SELECTORS,
+    _debug_dump_view_data_popup,
     _export_crosstab_csv,
     _export_from_view_data_popup,
     _find_first,
@@ -138,12 +139,19 @@ class ViewDataPopupPage:
 
     def __init__(self, overlay_wait_side_effect=None, download=None, button_present=True):
         self.frames = []
+        self.url = "https://insight.example.com/vizql/v_test/hybrid-window/min/index.html"
         self.download_button = FakeLocator(present=button_present)
         self.wait_for_timeout = MagicMock()
         self.wait_for_load_state = MagicMock()
         self.goto = MagicMock()
         self.screenshot = MagicMock()
         self._download = download
+
+        def _title():
+            return "View Data: Test Sheet"
+
+        self.title = _title
+        self.evaluate = MagicMock(return_value=[])
 
         self.overlay_locators = {}
         for selector in OVERLAY_SELECTORS:
@@ -170,6 +178,96 @@ class ViewDataPopupPage:
 
     def expect_download(self, timeout=None):
         return _DownloadCM(self._download)
+
+
+class DebugDumpPage:
+    """Fake for _debug_dump_view_data_popup()'s target page: exposes
+    .url, .title(), .screenshot(), and .evaluate() (dispatching the three
+    expected calls -- buttons, download-text elements, toolbar HTML -- by
+    call order), each independently able to raise to prove the dump never
+    lets a diagnostic failure break the caller."""
+
+    def __init__(
+        self,
+        url="https://insight.example.com/vizql/v_test/hybrid-window/min/index.html",
+        title="View Data: Persentase Nasional",
+        buttons=None,
+        download_elements=None,
+        toolbar_html=None,
+        title_raises=False,
+        screenshot_raises=False,
+        evaluate_raises=False,
+    ):
+        self.url = url
+        self._title = title
+        self._buttons = buttons if buttons is not None else []
+        self._download_elements = download_elements if download_elements is not None else []
+        self._toolbar_html = toolbar_html
+        self._title_raises = title_raises
+        self._evaluate_raises = evaluate_raises
+        self._evaluate_call_count = 0
+        self.screenshot = MagicMock(
+            side_effect=RuntimeError("screenshot failed") if screenshot_raises else None
+        )
+
+    def title(self):
+        if self._title_raises:
+            raise RuntimeError("title failed")
+        return self._title
+
+    def evaluate(self, script):
+        if self._evaluate_raises:
+            raise RuntimeError("evaluate failed")
+        self._evaluate_call_count += 1
+        if self._evaluate_call_count == 1:
+            return self._buttons
+        if self._evaluate_call_count == 2:
+            return self._download_elements
+        return self._toolbar_html
+
+
+def test_debug_dump_view_data_popup_prints_diagnostics_and_saves_screenshot(tmp_path, capsys):
+    buttons = [
+        {
+            "tag": "BUTTON",
+            "inner_text": "Download",
+            "aria_label": "Download",
+            "role": None,
+            "data_tb_test_id": "download-Button",
+            "title": None,
+        }
+    ]
+    download_elements = [
+        {
+            "tag": "DIV",
+            "text": "Download",
+            "aria_label": None,
+            "title": None,
+            "data_tb_test_id": None,
+            "class_name": "toolbar-item",
+        }
+    ]
+    toolbar_html = {
+        "element_html": "<div>Download</div>",
+        "parent_html": '<div class="toolbar">...</div>',
+        "grandparent_html": None,
+    }
+    page = DebugDumpPage(buttons=buttons, download_elements=download_elements, toolbar_html=toolbar_html)
+
+    _debug_dump_view_data_popup(page, tmp_path)
+
+    page.screenshot.assert_called_once_with(path=str(tmp_path / "debug_view_data_popup.png"))
+    out = capsys.readouterr().out
+    assert "popup.url" in out
+    assert "View Data: Persentase Nasional" in out
+    assert "download-Button" in out
+    assert "toolbar-item" in out
+    assert "<div class=\"toolbar\">" in out
+
+
+def test_debug_dump_view_data_popup_never_raises_despite_every_step_failing(tmp_path):
+    page = DebugDumpPage(title_raises=True, screenshot_raises=True, evaluate_raises=True)
+    _debug_dump_view_data_popup(page, tmp_path)  # must not raise
 
 
 def test_generate_export_filename_format():
