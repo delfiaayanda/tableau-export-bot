@@ -895,6 +895,90 @@ issuing `get-view-data-dialog-tab-pres-model` without a prior
 popup's own click-triggered JS to have done it) is accepted by the
 server.
 
+### The popup already does the whole export automatically -- discovery abandoned entirely
+
+**A user ran the session-discovery version against the real server, and
+the result was conclusive.** The run got further than ever before:
+login succeeded, the dashboard loaded, Download -> Data opened the real
+popup -- and this project's own diagnostic-only network logger
+(`_attach_export_network_diagnostics()`, unchanged, kept purely for
+visibility) recorded, in order:
+
+```
+[NETDEBUG] request  method=POST url=.../sessions/REDACTED/commands/tabsrv/export-view-data-summary-to-csv-server
+[NETDEBUG] response status=200 content_type='application/octet-stream;charset=UTF-8' url=.../sessions/REDACTED/commands/tabsrv/export-view-data-summary-to-csv-server
+[NETDEBUG] request  method=GET url=.../tempfile/sessions/REDACTED?key=REDACTED&keepfile=yes&attachment=yes
+[NETDEBUG] response status=200 content_type='text/csv' url=.../tempfile/sessions/REDACTED?key=REDACTED&keepfile=yes&attachment=yes <-- tempfile response
+FAILURE: Could not discover an active VizQL session from the dashboard or View Data pages (checked Performance Resource Timing entries and cookies).
+```
+
+The real export -- the exact HAR-documented `export-view-data-summary-to-csv-server`
+command **and** its `tempfile` GET -- fired and succeeded **on their
+own**, entirely from the popup's own internal JS, with no click, no
+VizQL session discovery, and no command issued by this project at all.
+Meanwhile the `_discover_active_vizql_session()` machinery this project
+had built to *reconstruct* that exact flow failed and aborted the run,
+throwing the already-successful, already-observed CSV data away.
+
+This retroactively explains every confusing finding from the DOM
+investigation: the popup's body is empty and it's titled "Hybrid Popup
+Window" because it is a background worker with no human-facing UI at
+all -- its entire job is to run this export automatically the moment it
+opens, not to host a dialog. There was never a button to find because
+there was never anything to click.
+
+The fix removed the entire reconstruction machinery --
+`_ViewDataSessionCapture`, `_find_vizql_session_in_resource_urls()`,
+`_find_xsrf_token_in_cookies()`, `_discover_active_vizql_session()`,
+`_safe_response_text_snippet()`, `_fetch_view_data_dialog_tab_pres_model()`,
+`_export_view_data_via_vizql_commands()`, and `_find_key_recursive()` --
+and replaced it with something much smaller that captures the
+already-succeeding response instead of rebuilding it:
+
+- `_capture_tempfile_response()` -- a passive handler, structurally
+  identical to the existing `_log_export_response()` diagnostic logger,
+  that snapshots the first observed `.../tempfile/...` response
+  (`status`/`headers`/`body()`, via a small `_CapturedTempfile` value
+  object) into a `_TempfileCapture` holder. Never logs the body.
+- `_attach_export_network_diagnostics()` now takes an optional
+  `tempfile_capture` parameter and registers this handler alongside its
+  existing (unchanged) loggers -- the same attachment point that already
+  proved, live, that it reliably observes this traffic.
+- `_wait_for_tempfile_capture()` polls (no fixed sleep, reusing the
+  existing `NETWORK_EXPORT_TIMEOUT_MS`) until the capture is populated
+  or raises a clear `BrowserAutomationError` on timeout.
+- `_export_crosstab_csv()` attaches the capture before the "Data" click
+  (so nothing the popup does afterward can be missed), and after the
+  popup opens simply *waits* -- no click inside the popup, no command
+  issued, no session to discover. `_save_tempfile_response()`
+  (unchanged) validates and saves the captured body.
+
+Login, dashboard navigation, the Download-menu and "Data" clicks, popup
+detection, and the existing DOM diagnostic are all unchanged. No fixed
+sleeps, no bootstrap listeners, no popup DOM scraping, no timeout
+increases.
+
+Regression tests (`tests/test_browser_crosstab.py`) were rewritten to
+match: `_capture_tempfile_response()` (stores the first matching
+response, ignores the export command's own response, keeps only the
+first match, never raises on a broken response object);
+`_wait_for_tempfile_capture()` (returns immediately when already
+captured, raises on timeout); `_attach_export_network_diagnostics()`
+(registers the logger pair with or without a capture, and -- exercising
+the exact real mechanism, not just asserting registration -- firing a
+real "response" event through the registered handler and confirming the
+capture is populated); and a full `_export_crosstab_csv()` end-to-end
+test that simulates the popup firing the real tempfile response event
+mid-poll (via a `wait_for_timeout` side effect, the same mechanism a
+real Playwright wait dispatches queued events through), plus a
+never-observed-timeout case and a dedicated secrets-never-printed check.
+**This is the version that produced the real successful `[NETDEBUG]`
+trace above** -- but that trace came from the *previous* (now-removed)
+implementation reaching the export step by coincidence, not from this
+fix; the fix itself has not yet been run against the real server. The
+next run is what will confirm the capture mechanism saves the file
+end-to-end.
+
 ## What is tested vs. not
 
 Tested in this environment (`pytest`, no network):
@@ -960,27 +1044,19 @@ Tested in this environment (`pytest`, no network):
   `_wait_for_dashboard()` (success + timeout), `_export_crosstab_csv()`
   (Download -> Data click sequence, catching the "View Data" popup via a
   fake `expect_popup()`, the popup-never-opens error path,
-  debug-screenshot-on-failure, and the full flow through to a saved CSV
-  via a fake browser context), `_find_key_recursive()` (nested dict,
-  nested list, not-found), `_ViewDataSessionCapture.has_session()`
-  (requires origin/path-prefix/session-id/XSRF token, not
-  visualIdPresModel/columns), `_find_vizql_session_in_resource_urls()`
-  (extracts session context from a matching Performance-resource URL,
-  returns `None` on no match), `_find_xsrf_token_in_cookies()` (matches
-  known cookie names, returns `None` when absent, never raises when
-  `.cookies()` fails), `_discover_active_vizql_session()` (finds the
-  session via a second page's resource URLs when the first has none,
-  returns immediately when already complete, raises on timeout),
-  `_safe_response_text_snippet()` (truncates to 300 chars, never raises
-  when reading the body fails), `_fetch_view_data_dialog_tab_pres_model()`
-  (success path asserting the exact request made, plus network-error,
-  non-OK-status, and missing-`visualIdPresModel` failure cases),
-  `_export_view_data_via_vizql_commands()` (the full discover -> fetch
-  tab-pres-model -> POST export-command -> GET tempfile success path,
-  asserting the exact calls made and the saved file's contents, plus
-  session-not-discoverable, network-error, non-OK-status,
-  missing-`resultKey`, and tempfile-fetch-failure cases),
-  `_is_export_related_url()` (matches only the two HAR-confirmed URL
+  debug-screenshot-on-failure, the full flow through to a saved CSV by
+  simulating the popup firing a real tempfile network event mid-poll, a
+  never-observed timeout case, and a dedicated secrets-never-printed
+  check), `_capture_tempfile_response()` (stores the first matching
+  tempfile response as a `_CapturedTempfile` snapshot, ignores the
+  export command's own response, keeps only the first match, never
+  raises on a broken response object), `_wait_for_tempfile_capture()`
+  (returns immediately when already captured, raises on timeout),
+  `_attach_export_network_diagnostics()` (registers the logger pair with
+  or without a `_TempfileCapture`, and -- firing a real event through
+  the registered handler, not just asserting registration -- confirms
+  the capture is actually populated), `_is_export_related_url()`
+  (matches only the two HAR-confirmed URL
   fragments), `_extract_filename_from_content_disposition()` (plain and
   RFC 5987 forms, absent header), `_sanitize_filename()` (strips path
   components and hostile characters, returns `None` for unusable input),
@@ -1012,21 +1088,16 @@ automation" above for exactly why):
   live dashboard's real markup — entirely unverified; they're
   best-effort accessible-role/name guesses, not confirmed by inspection.
 - Whether the login form is detected/filled correctly on the real page.
-- Whether the session-discovery approach (see "Discovering the session
-  instead of observing it" above) actually works end to end against the
-  real server: whether `performance.getEntriesByType("resource")` really
-  contains a matching VizQL command URL by the time it's checked,
-  whether the XSRF cookie is really named `XSRF-TOKEN` (or the other
-  checked variant) on this server, whether `get-view-data-dialog-tab-pres-model`
-  is accepted without this project having issued
-  `launch-hybrid-view-data-dialog` itself first, whether the discovered
-  session id/XSRF token/`visualIdPresModel`/origin/path prefix are
-  sufficient for Tableau to accept the `export-view-data-summary-to-csv-server`
-  POST issued via `page.context.request` (as opposed to a real
-  browser-driven request), whether `resultKey` is actually found in its
-  response, whether the `tempfile` GET succeeds, and whether the
-  exported CSV is complete when `columns` could not be captured (sent as
-  an empty list).
+- Whether the tempfile-capture approach (see "The popup already does the
+  whole export automatically" above) actually saves the file end to end
+  against the real server: whether `_attach_export_network_diagnostics()`
+  attached before the "Data" click reliably observes the tempfile
+  response on the very next real run (a prior version, since removed,
+  happened to observe it via its own separate diagnostic logger, but
+  that specific code path wasn't the one saving the file), and whether
+  the popup's automatic export behavior is consistent from run to run
+  rather than something that varied by session/timing on the one run
+  observed so far.
 
 Not tested, requires a machine with access to `insight.erajaya.com`:
 - `discover_api_version()` against the real `serverinfo` endpoint (a user

@@ -1,68 +1,45 @@
 """Browser-automated Tableau Crosstab CSV export via Playwright.
 
 Login and dashboard navigation reproduce the exact manual workflow
-already confirmed to work in the live Tableau UI. The final export step
-does NOT reproduce the workflow's *click* on "Download -> Data ->
-Download-within-the-popup" -- two separate real-server runs ruled that
-out completely (see CLAUDE.md, "Reproducing the export command
-directly"):
+already confirmed to work in the live Tableau UI: open Tableau, log in,
+load the dashboard, click Download -> Data. That click opens a separate
+"View Data" popup window (titled "Hybrid Popup Window") -- and a
+real-server run proved this popup's own JS then runs the ENTIRE HAR
+export sequence (see CLAUDE.md, "Native UI Crosstab download")
+automatically by itself: `export-view-data-summary-to-csv-server` POSTs
+and succeeds, then the resulting `tempfile` GET fires and returns the
+real CSV -- with no further click, no VizQL session to discover, and no
+command issued by this project at all. This explains everything earlier
+investigation found confusing: the popup's DOM is entirely empty (0
+buttons, 0 frames with content) because it is a background worker, not a
+dialog for a human to interact with; the main dashboard's own Download
+button is real but irrelevant here (Tableau's own dialog overlay blocks
+it while this popup is open, and clicking it again was never going to
+trigger anything).
 
-  - The "View Data" popup opened by Download -> Data is a "Hybrid Popup
-    Window" wrapper with an entirely empty DOM (0 buttons, 0 frames with
-    content, 0 shadow roots, 0 canvases) -- there is nothing to click
-    inside it.
-  - The main dashboard's own Download button IS the real, correct DOM
-    node (confirmed by a real Playwright locator resolving to
-    `#download` / `data-tb-test-id="viz-viewer-toolbar-button-download"`),
-    but while the View Data dialog is open, Tableau's own
-    `Dialog-Provider-Dialog-Glass` overlay intentionally blocks it --
-    clicking it again just hangs, it does not trigger anything.
+Two earlier versions tried to *reconstruct* this flow instead of
+capturing it: first by observing Tableau's bootstrap VizQL commands via
+network listeners (attached at various points -- both timed out having
+captured nothing, since the commands weren't reliably observable that
+way here), then by *discovering* an already-active VizQL session from
+Performance Resource Timing entries and cookies and reissuing the
+export/tempfile commands via `page.context.request` -- which reached
+the real server but failed at the discovery step, while this project's
+own OWN diagnostic-only network logger (still attached alongside,
+unchanged) had already observed the real popup completing the entire
+export successfully in the background. That was the actual evidence:
+nothing needed reconstructing.
 
-Instead, this reproduces Tableau's own VizQL command flow directly, per
-the HAR capture in CLAUDE.md ("Native UI Crosstab download") -- by
-*discovering* the browser's already-established VizQL session from
-state that already exists, not by *observing* its creation via network
-listeners. Two earlier versions attached `page`/context-level
-"request"/"response" listeners (first right before the "Data" click,
-then moved to right after the dashboard navigation) hoping to capture
-the session id, `X-XSRF-TOKEN`, and `visualIdPresModel` as Tableau's own
-JS fired its bootstrap VizQL commands. Both timed out against the real
-server having captured nothing, even though the dashboard loaded and the
-View Data popup opened correctly -- proving the commands are not
-reliably observable as ordinary Playwright network events at all (this
-Tableau version may issue them in a way outside Playwright's page-level
-CDP Network domain, or on a timing/target this project could not pin
-down after two attempts).
-
-`_discover_active_vizql_session()` instead reads state that already
-exists once the dashboard (and/or the View Data popup) has loaded, no
-listener required:
-  - The VizQL session id and workbook/view path, from the URL of any
-    already-completed VizQL command -- recovered via the standard
-    Performance Resource Timing API (`performance.getEntriesByType
-    ("resource")`), which every browser keeps for the life of the page
-    regardless of whether anything was "listening" when the request
-    happened. Any interactive Tableau viz must have issued at least one
-    such command just to render, so this exists by the time the
-    dashboard (or popup) is visibly loaded.
-  - The `X-XSRF-TOKEN` value, read directly from its matching cookie
-    (`context.cookies()`) -- Tableau's own header name is exactly
-    Angular's default double-submit-cookie header, which is only ever
-    populated from a same-named cookie, so the value doesn't need to be
-    captured off any particular outgoing request.
-
-Once a session is discovered, `_fetch_view_data_dialog_tab_pres_model()`
-issues that one HAR-confirmed command itself (`get-view-data-dialog-tab-pres-model`)
-via the browser's own authenticated request context to obtain
-`visualIdPresModel`/`columns` directly from its response, rather than
-waiting to observe the popup's own copy of that same call.
-`_export_view_data_via_vizql_commands()` then issues the final two HAR
-steps -- POST `export-view-data-summary-to-csv-server`, GET the
-resulting `tempfile` URL -- the same way: via `page.context.request`,
-which reuses the real session's cookies automatically, never a separate
-login or credential flow. None of this depends on any DOM element
-existing, in the popup or anywhere else, and none of it depends on a
-network listener catching anything at the right moment.
+`_attach_export_network_diagnostics()` now takes an optional
+`_TempfileCapture` and, alongside its existing (unchanged) request/
+response logging, snapshots the first real `.../tempfile/...` response
+it sees via `_capture_tempfile_response()`. `_wait_for_tempfile_capture()`
+polls (no fixed sleep) until that capture is populated or times out.
+`_export_crosstab_csv()` attaches this before the "Data" click (so
+nothing the popup's JS does afterward can be missed), then simply waits
+for it once the popup has opened -- no click inside the popup, no
+command issued, no session discovery. `_save_tempfile_response()`
+(unchanged) validates and saves the captured response's body.
 
 NOT exercised against the real server from this environment: no browser
 binary is installed here (Chromium download is blocked by this sandbox's
@@ -137,30 +114,6 @@ NETWORK_EXPORT_TIMEOUT_MS = 30_000
 # "Network-based export" in CLAUDE.md for why.
 EXPORT_COMMAND_URL_SUBSTRING = "export-view-data-summary-to-csv-server"
 TEMPFILE_URL_SUBSTRING = "/tempfile/"
-
-# The leading "t/{site}/" segment is Tableau's own documented convention
-# for a non-default site (omitted entirely for the Default site, which
-# is what every URL confirmed so far in this project -- e.g. the plain
-# `/#/views/...` dashboard URL -- is consistent with); made optional here
-# rather than assumed, so this still matches if TABLEAU_SITE is set.
-VIZQL_SESSION_ID_RE = re.compile(r"/vizql/((?:t/[^/]+/)?w/[^/]+/v/[^/]+)/sessions/([^/?]+)/")
-VISUAL_ID_PRES_MODEL_KEY = "visualIdPresModel"
-COLUMNS_KEY = "columns"
-
-# Standard Performance Resource Timing API -- every browser keeps this
-# for the life of the page regardless of whether a Playwright listener
-# was attached at the right moment. Returns only URLs (never bodies,
-# headers, or timing values we don't use), so it's safe to read without
-# any redaction concern beyond the existing _redact_url() used before
-# printing anything.
-PERFORMANCE_RESOURCE_URLS_SCRIPT = "() => performance.getEntriesByType('resource').map(e => e.name)"
-
-# Tableau's own VizQL commands send an X-XSRF-TOKEN header -- exactly
-# Angular's default double-submit-cookie header name, which Angular's
-# HttpClientXsrfModule only ever populates from a same-named cookie by
-# default. Reading the cookie directly avoids needing to observe any
-# particular outgoing request's headers.
-XSRF_COOKIE_NAMES = {"xsrf-token", "x-xsrf-token"}
 
 DOWNLOAD_BUTTON_CANDIDATES = [
     lambda s: s.get_by_role("button", name=re.compile(r"^download$", re.I)),
@@ -354,22 +307,90 @@ def _log_export_response(response) -> None:
         pass
 
 
-def _attach_export_network_diagnostics(pages) -> None:
+class _CapturedTempfile:
+    """An immutable snapshot of the tempfile response's status/headers/
+    body, taken eagerly at capture time -- matches the small subset of
+    Playwright's Response/APIResponse interface _save_tempfile_response()
+    actually uses, so that function needs no changes. Snapshotting
+    eagerly (rather than holding the live Response object) avoids
+    depending on it staying readable after the page/context that
+    produced it moves on."""
+
+    def __init__(self, url: str, status: int, headers: dict, body: bytes):
+        self.url = url
+        self.status = status
+        self.headers = headers
+        self._body = body
+
+    def body(self) -> bytes:
+        return self._body
+
+
+class _TempfileCapture:
+    """Holds the tempfile response once observed, populated by
+    _capture_tempfile_response()."""
+
+    def __init__(self):
+        self.response: _CapturedTempfile | None = None
+
+
+def _capture_tempfile_response(response, capture: _TempfileCapture) -> None:
+    """Passively snapshots the first observed `.../tempfile/...`
+    response. A real-server run showed Tableau's own "View Data" popup
+    JS fires the entire export-view-data-summary-to-csv-server ->
+    tempfile sequence automatically, with no click and no command issued
+    by this project at all -- this captures that real response directly
+    instead of reconstructing/reissuing anything ourselves. Never logs
+    the body. Never raises."""
+    try:
+        if capture.response is not None or not _is_tempfile_url(response.url):
+            return
+        capture.response = _CapturedTempfile(
+            url=response.url,
+            status=response.status,
+            headers=dict(response.headers or {}),
+            body=response.body(),
+        )
+    except Exception:
+        pass
+
+
+def _attach_export_network_diagnostics(pages, tempfile_capture: _TempfileCapture | None = None) -> None:
     """Attaches the request/response loggers above to each given page
     (typically the main dashboard page and the "View Data" popup page --
     a real-server diagnostic could not tell which one the export command
     actually fires on, so both are covered per CLAUDE.md's "Network-based
     export"). Playwright's page-level "request"/"response" events also
     bubble to the browser context, so this alone is enough to observe
-    traffic regardless of which of these two pages originates it. Safe to
-    call on lightweight test fakes that don't support `.on()` -- failures
-    are reported but never raised."""
+    traffic regardless of which of these two pages originates it.
+
+    When `tempfile_capture` is given, also attaches
+    _capture_tempfile_response() alongside the loggers -- confirmed by a
+    real-server run to reliably observe the real, complete tempfile
+    response the popup's own JS fires on its own. Safe to call on
+    lightweight test fakes that don't support `.on()` -- failures are
+    reported but never raised."""
     for page in pages:
         try:
             page.on("request", _log_export_request)
             page.on("response", _log_export_response)
+            if tempfile_capture is not None:
+                page.on("response", lambda response: _capture_tempfile_response(response, tempfile_capture))
         except Exception as exc:
             print(f"[NETDEBUG] could not attach network listeners to a page: {exc}")
+
+
+def _wait_for_tempfile_capture(driver_page, capture: _TempfileCapture, timeout_ms) -> None:
+    """Polls (no fixed sleep) until _capture_tempfile_response() has
+    observed the real tempfile response, or raises on timeout."""
+    deadline = time.monotonic() + timeout_ms / 1000
+    while capture.response is None:
+        if time.monotonic() >= deadline:
+            raise BrowserAutomationError(
+                "Never observed the View Data tempfile response (see the [NETDEBUG] log "
+                "above for whatever export-related network activity was actually observed)."
+            )
+        driver_page.wait_for_timeout(POLL_INTERVAL_MS)
 
 
 def _extract_filename_from_content_disposition(content_disposition: str | None) -> str | None:
@@ -462,14 +483,17 @@ def _export_crosstab_csv(page, export_dir: Path):
         _save_debug_screenshot(page, export_dir, "data-menuitem-not-found")
         raise BrowserAutomationError("Could not find the 'Data' item in the Download menu.")
 
-    _attach_export_network_diagnostics([page])
+    tempfile_capture = _TempfileCapture()
+    _attach_export_network_diagnostics([page], tempfile_capture)
 
     # Clicking "Data" opens a separate "View Data" popup window/tab (a new
     # Playwright Page in the same browser context, titled
-    # "View Data: <sheet name>") -- not an in-page dialog. This click is
-    # kept (confirmed working against the real server); what happens next
-    # is not a further click inside this popup, but reproducing Tableau's
-    # own VizQL export command directly -- see _export_view_data_via_vizql_commands().
+    # "Hybrid Popup Window") -- not an in-page dialog. This click is kept
+    # (confirmed working against the real server). A real-server run
+    # showed this popup's own JS then fires the entire HAR export
+    # sequence AUTOMATICALLY on its own -- no further click, no command
+    # issued by this project -- so nothing more is triggered here; see
+    # _wait_for_tempfile_capture() below.
     try:
         with page.expect_popup(timeout=VIEW_DATA_POPUP_TIMEOUT_MS) as popup_info:
             data_item.click()
@@ -479,19 +503,17 @@ def _export_crosstab_csv(page, export_dir: Path):
         _save_debug_screenshot(page, export_dir, "view-data-popup-not-opened")
         raise BrowserAutomationError(f"The 'View Data' popup window did not open: {exc}") from exc
 
-    _attach_export_network_diagnostics([view_data_page])
+    _attach_export_network_diagnostics([view_data_page], tempfile_capture)
 
     # --- TEMPORARY DEBUG ONLY -- kept per explicit instruction even though
     # a real-server run already showed this popup's own DOM is effectively
-    # empty (see CLAUDE.md, "Network-based export"); still useful context
-    # if a future Tableau update changes that. Never touches
-    # credentials/cookies/tokens. The actual export below does not depend
-    # on this popup's DOM at all -- see _export_view_data_via_vizql_commands().
+    # empty (see CLAUDE.md); still useful context if a future Tableau
+    # update changes that. Never touches credentials/cookies/tokens.
     _debug_dump_view_data_popup(view_data_page, export_dir)
 
     print("Exporting Crosstab...")
-    capture = _ViewDataSessionCapture()
-    return _export_view_data_via_vizql_commands(page, view_data_page, capture, export_dir)
+    _wait_for_tempfile_capture(view_data_page, tempfile_capture, NETWORK_EXPORT_TIMEOUT_MS)
+    return _save_tempfile_response(tempfile_capture.response, export_dir)
 
 
 def _redact_url(url: str) -> str:
@@ -712,299 +734,6 @@ def _debug_dump_view_data_popup(view_data_page, export_dir: Path) -> None:
             print(f"[DEBUG]   page[{index}] url={_redact_url(context_page.url)} title={page_title!r}")
     except Exception as exc:
         print(f"[DEBUG] browser context page enumeration failed: {exc}")
-
-
-def _find_key_recursive(obj, key: str):
-    """Recursively searches a JSON-like structure (nested dicts/lists) for
-    the first occurrence of `key`, returning its value or None.
-
-    Tableau's VizQL command responses were never captured beyond the
-    field NAMES confirmed in the original HAR (see CLAUDE.md) -- their
-    exact nesting is unknown and was never guessed. A targeted key search
-    uses only the one fact that IS certain (the field's name), rather
-    than a hardcoded path that would break the moment the real response
-    shape differs even slightly."""
-    if isinstance(obj, dict):
-        if key in obj:
-            return obj[key]
-        for value in obj.values():
-            found = _find_key_recursive(value, key)
-            if found is not None:
-                return found
-    elif isinstance(obj, list):
-        for item in obj:
-            found = _find_key_recursive(item, key)
-            if found is not None:
-                return found
-    return None
-
-
-class _ViewDataSessionCapture:
-    """Accumulates the pieces needed to reproduce Tableau's own View Data
-    VizQL commands -- discovered from already-existing browser state (see
-    _discover_active_vizql_session()), never typed, guessed, or
-    hardcoded. `visual_id_pres_model`/`columns` are filled in later, by
-    _fetch_view_data_dialog_tab_pres_model()."""
-
-    def __init__(self):
-        self.origin: str | None = None
-        self.command_path_prefix: str | None = None  # e.g. "w/ReturnRotate/v/Dashboard1"
-        self.session_id: str | None = None
-        self.xsrf_token: str | None = None
-        self.visual_id_pres_model: str | None = None
-        self.columns: list | None = None
-
-    def has_session(self) -> bool:
-        """True once enough is known to address any VizQL command on
-        this session (before visualIdPresModel/columns are fetched)."""
-        return bool(self.origin and self.command_path_prefix and self.session_id and self.xsrf_token)
-
-
-def _find_vizql_session_in_resource_urls(urls):
-    """Searches a list of URLs (from the Performance Resource Timing API)
-    for the first one that looks like a VizQL command, returning
-    (origin, command_path_prefix, session_id) or None. Never raises --
-    a malformed URL is simply skipped."""
-    for url in urls:
-        try:
-            match = VIZQL_SESSION_ID_RE.search(url)
-            if not match:
-                continue
-            parts = urlsplit(url)
-            return f"{parts.scheme}://{parts.netloc}", match.group(1), match.group(2)
-        except Exception:
-            continue
-    return None
-
-
-def _find_xsrf_token_in_cookies(context) -> str | None:
-    """Reads the browser context's own cookies for the one matching
-    Tableau's X-XSRF-TOKEN header name (see XSRF_COOKIE_NAMES). Never
-    raises, never logs the cookie jar."""
-    try:
-        cookies = context.cookies()
-    except Exception:
-        return None
-    for cookie in cookies:
-        try:
-            if cookie.get("name", "").lower() in XSRF_COOKIE_NAMES:
-                value = cookie.get("value")
-                if value:
-                    return value
-        except Exception:
-            continue
-    return None
-
-
-def _discover_active_vizql_session(pages, capture: _ViewDataSessionCapture) -> None:
-    """Recovers the VizQL session the browser has *already* established
-    (during the dashboard's own load, and/or the View Data popup's) from
-    existing browser state, instead of trying to observe its creation via
-    a network listener -- two real-server runs of the listener-based
-    approach captured nothing at all, even though the dashboard and
-    popup both loaded correctly, showing these commands are not reliably
-    observable as ordinary Playwright network events here. See the
-    module docstring.
-
-    Polls each given page's Performance Resource Timing entries (no
-    fixed sleep -- a brief retry loop only in case the buffer hasn't
-    recorded anything at the exact instant this is first called) and the
-    browser context's cookies, until a session is found or the existing
-    VIEW_DATA_POPUP_TIMEOUT_MS elapses (no new/longer timeout added)."""
-    context = pages[0].context
-    deadline = time.monotonic() + VIEW_DATA_POPUP_TIMEOUT_MS / 1000
-    while True:
-        if not capture.has_session():
-            for page in pages:
-                try:
-                    urls = page.evaluate(PERFORMANCE_RESOURCE_URLS_SCRIPT)
-                except Exception:
-                    continue
-                found = _find_vizql_session_in_resource_urls(urls)
-                if found:
-                    capture.origin, capture.command_path_prefix, capture.session_id = found
-                    break
-            if capture.xsrf_token is None:
-                capture.xsrf_token = _find_xsrf_token_in_cookies(context)
-        if capture.has_session():
-            return
-        if time.monotonic() >= deadline:
-            raise BrowserAutomationError(
-                "Could not discover an active VizQL session from the dashboard or View "
-                "Data pages (checked Performance Resource Timing entries and cookies)."
-            )
-        pages[0].wait_for_timeout(POLL_INTERVAL_MS)
-
-
-def _safe_response_text_snippet(response, limit: int = 300) -> str:
-    """A short, truncated text snippet of a response body, safe to
-    include directly in an error message -- this is Tableau's own
-    status/error text, the same kind of thing crosstab_probe.py already
-    surfaces this way (response.text[:300]), not session/user data.
-    Never raises -- an unreadable body is reported as such."""
-    try:
-        return response.text()[:limit]
-    except Exception:
-        return "<no response body available>"
-
-
-def _fetch_view_data_dialog_tab_pres_model(request_context, capture: _ViewDataSessionCapture) -> None:
-    """Issues the HAR-confirmed `get-view-data-dialog-tab-pres-model`
-    VizQL command directly, via the browser's own authenticated request
-    context, to obtain `visualIdPresModel`/`columns` from its own
-    response -- rather than waiting to observe the View Data popup's own
-    copy of this same call (the approach that failed against the real
-    server). Its exact request body was never captured beyond the
-    `telemetryCommandId` field already confirmed as common to sibling
-    tabsrv commands (see CLAUDE.md) -- no other field is invented.
-    Raises BrowserAutomationError with the real HTTP status and a
-    truncated response body on any failure, so the actual server
-    response is visible from the error alone."""
-    url = (
-        f"{capture.origin}/vizql/{capture.command_path_prefix}"
-        f"/sessions/{capture.session_id}/commands/tabsrv/get-view-data-dialog-tab-pres-model"
-    )
-    try:
-        response = request_context.post(
-            url,
-            headers={"X-XSRF-TOKEN": capture.xsrf_token},
-            multipart={"telemetryCommandId": uuid.uuid4().hex[:30]},
-            timeout=NETWORK_EXPORT_TIMEOUT_MS,
-        )
-    except Exception as exc:
-        raise BrowserAutomationError(
-            f"Could not issue the View Data tab presentation model command: {exc}"
-        ) from exc
-
-    if not response.ok:
-        raise BrowserAutomationError(
-            "The View Data tab presentation model command returned HTTP "
-            f"{response.status}: {_safe_response_text_snippet(response)}"
-        )
-
-    try:
-        body = response.json()
-    except Exception as exc:
-        raise BrowserAutomationError(
-            "The View Data tab presentation model command returned an unparseable "
-            f"response: {exc}"
-        ) from exc
-
-    value = _find_key_recursive(body, VISUAL_ID_PRES_MODEL_KEY)
-    if isinstance(value, str) and value:
-        capture.visual_id_pres_model = value
-
-    columns = _find_key_recursive(body, COLUMNS_KEY)
-    if isinstance(columns, list) and columns and all(isinstance(item, str) for item in columns):
-        capture.columns = columns
-
-    if not capture.visual_id_pres_model:
-        raise BrowserAutomationError(
-            "The View Data tab presentation model command succeeded but no "
-            "visualIdPresModel was found in its response (see CLAUDE.md's documented "
-            "field name -- it may have changed)."
-        )
-
-
-def _export_view_data_via_vizql_commands(
-    page, view_data_page, capture: _ViewDataSessionCapture, export_dir: Path
-) -> Path:
-    """Reproduces Tableau's own View Data CSV export by issuing its VizQL
-    commands directly over HTTP, instead of clicking anything -- see the
-    module docstring for why every DOM-based approach, and every
-    listener-based capture approach, was ruled out.
-
-    1. `_discover_active_vizql_session()` recovers the session id,
-       workbook/view path, and X-XSRF-TOKEN from browser state that
-       already exists (Performance Resource Timing entries + cookies).
-    2. `_fetch_view_data_dialog_tab_pres_model()` issues that HAR command
-       itself to obtain `visualIdPresModel`/`columns` directly from its
-       response.
-    3. This then POSTs `export-view-data-summary-to-csv-server` and GETs
-       the resulting `tempfile` URL, using `page.context.request` -- a
-       Playwright APIRequestContext that automatically reuses the real
-       browser session's cookies (Playwright: "The method will populate
-       request cookies from the context"), so no separate login, cookie
-       handling, or credential logic is needed. The X-XSRF-TOKEN header
-       is the one thing Playwright does not attach automatically -- it's
-       set from the value discovered in step 1.
-
-    `columns` is sent as an empty list when the tab-pres-model command
-    doesn't yield one -- a known limitation (see CLAUDE.md): it's
-    unverified whether Tableau accepts that as "all columns" or requires
-    the real list."""
-    _discover_active_vizql_session([page, view_data_page], capture)
-    print(f"[NETDEBUG] discovered VizQL session (session={bool(capture.session_id)}, xsrf={bool(capture.xsrf_token)})")
-
-    request_context = page.context.request
-
-    _fetch_view_data_dialog_tab_pres_model(request_context, capture)
-    print(f"[NETDEBUG] fetched tab presentation model (columns={bool(capture.columns)})")
-
-    export_url = (
-        f"{capture.origin}/vizql/{capture.command_path_prefix}"
-        f"/sessions/{capture.session_id}/commands/tabsrv/export-view-data-summary-to-csv-server"
-    )
-    multipart = {
-        "visualIdPresModel": capture.visual_id_pres_model,
-        "showAliases": "true",
-        "columns": json.dumps(capture.columns or []),
-        "listSeparatorValue": ",",
-        "unicodeEncodingValue": "UTF-8",
-        "telemetryCommandId": uuid.uuid4().hex[:30],
-    }
-
-    try:
-        export_response = request_context.post(
-            export_url,
-            headers={"X-XSRF-TOKEN": capture.xsrf_token},
-            multipart=multipart,
-            timeout=NETWORK_EXPORT_TIMEOUT_MS,
-        )
-    except Exception as exc:
-        _save_debug_screenshot(view_data_page, export_dir, "vizql-export-command-failed")
-        raise BrowserAutomationError(f"Could not issue the View Data export command: {exc}") from exc
-
-    print(
-        f"[NETDEBUG] export command response status={export_response.status} "
-        f"url={_redact_url(export_url)}"
-    )
-    if not export_response.ok:
-        _save_debug_screenshot(view_data_page, export_dir, "vizql-export-command-failed")
-        raise BrowserAutomationError(
-            "The View Data export command returned HTTP "
-            f"{export_response.status}: {_safe_response_text_snippet(export_response)}"
-        )
-
-    try:
-        export_body = export_response.json()
-    except Exception as exc:
-        raise BrowserAutomationError(
-            f"The View Data export command returned an unparseable response: {exc}"
-        ) from exc
-
-    result_key = _find_key_recursive(export_body, "resultKey")
-    if not result_key:
-        raise BrowserAutomationError(
-            "The View Data export command succeeded but no resultKey was found in its "
-            "response (see CLAUDE.md's documented response shape -- it may have changed)."
-        )
-
-    tempfile_url = f"{capture.origin}/vizql/{capture.command_path_prefix}/tempfile/sessions/{capture.session_id}"
-    try:
-        tempfile_response = request_context.get(
-            tempfile_url,
-            params={"key": result_key, "keepfile": "yes", "attachment": "yes"},
-            timeout=NETWORK_EXPORT_TIMEOUT_MS,
-        )
-    except Exception as exc:
-        raise BrowserAutomationError(f"Could not fetch the exported tempfile: {exc}") from exc
-
-    print(
-        f"[NETDEBUG] tempfile response status={tempfile_response.status} "
-        f"url={_redact_url(tempfile_url)}"
-    )
-    return _save_tempfile_response(tempfile_response, export_dir)
 
 
 def run_browser_crosstab_export(
