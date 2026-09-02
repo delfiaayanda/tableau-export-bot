@@ -1,0 +1,1473 @@
+"""Tests the browser automation module's pure logic and step functions
+using lightweight fake Playwright-like objects -- no real browser, no
+real network call. This does NOT prove the DOM selectors match the live
+Tableau UI (impossible without a real browser and live access); it
+proves our own orchestration, fallback-matching, file-saving, and
+credential-handling logic is correct. See CLAUDE.md for what remains
+unverified live.
+"""
+
+import json
+from datetime import datetime
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from src.exportbot.browser_crosstab import (
+    _DownloadCapture,
+    _TempfileCapture,
+    _attach_download_capture,
+    _attach_export_network_diagnostics,
+    _attach_message_listener,
+    _attach_popup_runtime_diagnostics,
+    _capture_download,
+    _capture_tempfile_response,
+    _debug_dump_hydration_signals,
+    _debug_dump_view_data_popup,
+    _describe_locator,
+    _export_crosstab_csv,
+    _extract_filename_from_content_disposition,
+    _find_first,
+    _inspect_frame,
+    _is_export_related_url,
+    _login_if_needed,
+    _read_hydration_signals,
+    _redact_url,
+    _sanitize_filename,
+    _save_tempfile_response,
+    _switch_to_full_data_and_download,
+    _wait_for_dashboard,
+    _wait_for_download_button_ready,
+    _wait_for_download_capture,
+    _wait_for_tempfile_capture,
+    generate_export_filename,
+    resolve_executable_path,
+    resolve_headless,
+    run_browser_crosstab_export,
+)
+from src.exportbot.exceptions import BrowserAutomationError
+
+
+class FakeLocator:
+    def __init__(self, present=True):
+        self._present = present
+        self.click = MagicMock()
+        self.fill = MagicMock()
+        self.wait_for = MagicMock()
+
+    def count(self):
+        return 1 if self._present else 0
+
+    @property
+    def first(self):
+        return self
+
+
+class FakeAPIResponse:
+    """Fake for a Playwright Response -- stands in for the real
+    `.../tempfile/...` response a real-server run confirmed the "View
+    Data" popup's own JS delivers automatically. Only the shape
+    `_save_tempfile_response()` and `_capture_tempfile_response()`
+    actually use: status/headers/body()."""
+
+    def __init__(self, url, status=200, headers=None, body=b"Product,Region\nWidget,East\n"):
+        self.url = url
+        self.status = status
+        self.headers = headers if headers is not None else {"content-type": "text/csv"}
+        self._body = body
+
+    def body(self):
+        return self._body
+
+
+class FakeEventPage:
+    """Base for a fake Playwright page/popup that supports .on()/firing
+    registered handlers -- lets tests simulate the browser's own network
+    events (the mechanism _attach_export_network_diagnostics() and
+    _capture_tempfile_response() actually rely on) without a real
+    browser. `on_raises=True` simulates `.on()` itself failing."""
+
+    def __init__(self, on_raises=False):
+        self._handlers = {}
+        self._on_raises = on_raises
+
+    def on(self, event, handler):
+        if self._on_raises:
+            raise RuntimeError("on() failed")
+        self._handlers.setdefault(event, []).append(handler)
+
+    def fire(self, event, arg):
+        for handler in self._handlers.get(event, []):
+            handler(arg)
+
+
+class _PopupCM:
+    """Mirrors how Playwright's expect_popup() actually behaves: the
+    popup wait resolves (or times out) when the `with` block exits, not
+    when .value is later read -- so a popup that never opens raises here,
+    in __exit__, the same place the real Playwright TimeoutError would."""
+
+    def __init__(self, popup):
+        self._popup = popup
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is None and self._popup is None:
+            raise TimeoutError("Timeout waiting for popup")
+        return False
+
+    @property
+    def value(self):
+        return self._popup
+
+
+class ScriptedPage(FakeEventPage):
+    """Returns pre-scripted FakeLocators in call order, regardless of
+    which get_by_*/locator method is used -- lets tests control exactly
+    which candidate in an ordered fallback list "matches" without
+    simulating real DOM text matching. Also a FakeEventPage, since
+    production code attaches network diagnostics to the main dashboard
+    page too."""
+
+    def __init__(self, script, popup=None, on_raises=False, context=None):
+        super().__init__(on_raises=on_raises)
+        self._script = list(script)
+        self._pos = 0
+        self.frames = []
+        self._popup = popup
+        self.wait_for_timeout = MagicMock()
+        self.wait_for_load_state = MagicMock()
+        self.goto = MagicMock()
+        self.screenshot = MagicMock()
+        self.context = context if context is not None else FakeEventPage()
+
+    def _next(self, *args, **kwargs):
+        if self._pos >= len(self._script):
+            return FakeLocator(present=False)
+        loc = self._script[self._pos]
+        self._pos += 1
+        return loc
+
+    def get_by_role(self, *args, **kwargs):
+        return self._next()
+
+    def get_by_text(self, *args, **kwargs):
+        return self._next()
+
+    def get_by_label(self, *args, **kwargs):
+        return self._next()
+
+    def locator(self, *args, **kwargs):
+        return self._next()
+
+    def expect_popup(self, timeout=None):
+        return _PopupCM(self._popup)
+
+
+class ViewDataPopupPage(FakeEventPage):
+    """Fake for the "View Data" popup window opened by Download -> Data.
+
+    A HAR capture of the real manual Full Data workflow showed this
+    popup's UI must actually be clicked through -- "Full Data" then
+    "Download" -- to get the real Full Data export (its default tab is
+    "Summary"); it is not automatic. This fake supports scripted
+    locators (like ScriptedPage) so tests can control exactly which
+    candidate "matches" for each click, plus the same "response" event
+    firing (via FakeEventPage) that carries the resulting tempfile."""
+
+    def __init__(
+        self,
+        script=None,
+        url="https://insight.example.com/vizql/w/ReturnRotate/v/Dashboard1/hybrid-window/min/index.html",
+        on_raises=False,
+    ):
+        super().__init__(on_raises=on_raises)
+        self._script = list(script) if script is not None else []
+        self._pos = 0
+        self.frames = []
+        self.url = url
+        self.wait_for_timeout = MagicMock()
+        self.wait_for_load_state = MagicMock()
+        self.goto = MagicMock()
+        self.screenshot = MagicMock()
+
+        def _title():
+            return "Hybrid Popup Window"
+
+        self.title = _title
+
+    def _next(self, *args, **kwargs):
+        if self._pos >= len(self._script):
+            return FakeLocator(present=False)
+        loc = self._script[self._pos]
+        self._pos += 1
+        return loc
+
+    def get_by_role(self, *args, **kwargs):
+        return self._next()
+
+    def get_by_text(self, *args, **kwargs):
+        return self._next()
+
+    def get_by_label(self, *args, **kwargs):
+        return self._next()
+
+    def locator(self, *args, **kwargs):
+        return self._next()
+
+
+def test_redact_url_redacts_sensitive_params_but_keeps_others():
+    url = (
+        "https://insight.example.com/vizql/v_test/hybrid-window/min/index.html"
+        "?id=8C4A1AEB8A024C0AA761D90468368731&moduleId=view_data&sheet=Summary"
+    )
+    redacted = _redact_url(url)
+    assert "8C4A1AEB8A024C0AA761D90468368731" not in redacted
+    assert "id=REDACTED" in redacted
+    assert "moduleId=view_data" in redacted
+    assert "sheet=Summary" in redacted
+    assert redacted.startswith("https://insight.example.com/vizql/v_test/hybrid-window/min/index.html")
+
+
+def test_redact_url_never_raises_on_unparseable_input():
+    assert _redact_url(object()) == "[unparseable URL]"
+
+
+def test_redact_url_redacts_session_id_in_path():
+    """Every VizQL command/tempfile URL this module builds carries the
+    session id as a PATH segment (.../sessions/{id}/...), not a query
+    parameter -- this must be redacted too, or it leaks straight through
+    the [NETDEBUG] logs printed around the export/tempfile requests."""
+    url = (
+        "https://insight.example.com/vizql/w/ReturnRotate/v/Dashboard1"
+        "/sessions/SUPERSECRETSESSIONID/commands/tabsrv/export-view-data-summary-to-csv-server"
+    )
+    redacted = _redact_url(url)
+    assert "SUPERSECRETSESSIONID" not in redacted
+    assert "/sessions/REDACTED/" in redacted
+    assert redacted.startswith("https://insight.example.com/vizql/w/ReturnRotate/v/Dashboard1")
+
+
+def test_redact_url_redacts_session_id_in_path_and_key_in_query_together():
+    url = (
+        "https://insight.example.com/vizql/w/ReturnRotate/v/Dashboard1"
+        "/tempfile/sessions/SUPERSECRETSESSIONID?key=THERESULTKEY&keepfile=yes"
+    )
+    redacted = _redact_url(url)
+    assert "SUPERSECRETSESSIONID" not in redacted
+    assert "THERESULTKEY" not in redacted
+    assert "/sessions/REDACTED" in redacted
+    assert "key=REDACTED" in redacted
+    assert "keepfile=yes" in redacted
+
+
+class FakeFrame:
+    def __init__(self, url="https://insight.example.com/frame", name="", evaluate_result=None, evaluate_raises=False):
+        self.url = url
+        self.name = name
+        self._evaluate_result = evaluate_result if evaluate_result is not None else {}
+        self._evaluate_raises = evaluate_raises
+
+    def evaluate(self, script):
+        if self._evaluate_raises:
+            raise RuntimeError("evaluate failed")
+        return self._evaluate_result
+
+
+def test_inspect_frame_returns_evaluate_result():
+    expected = {"body_inner_html_length": 42, "buttons": []}
+    frame = FakeFrame(evaluate_result=expected)
+    assert _inspect_frame(frame) == expected
+
+
+def test_inspect_frame_returns_error_dict_on_exception():
+    frame = FakeFrame(evaluate_raises=True)
+    result = _inspect_frame(frame)
+    assert "error" in result
+    assert "evaluate failed" in result["error"]
+
+
+class FakeContextPage:
+    def __init__(self, url, title, title_raises=False):
+        self.url = url
+        self._title = title
+        self._title_raises = title_raises
+
+    def title(self):
+        if self._title_raises:
+            raise RuntimeError("title failed")
+        return self._title
+
+
+class FakeContext:
+    def __init__(self, pages):
+        self.pages = pages
+
+
+class RaisingContext:
+    """A .context stand-in whose .pages access always raises -- used to
+    confirm context-page enumeration failures are caught, without
+    polluting shared classes like MagicMock."""
+
+    @property
+    def pages(self):
+        raise RuntimeError("context failed")
+
+
+class DebugDumpPage:
+    """Fake for _debug_dump_view_data_popup()'s target page, matching the
+    frame-based + context-based implementation: exposes .url, .title(),
+    .screenshot(), .frames (a list of FakeFrame, each inspected via
+    _inspect_frame()), and .context.pages (other pages in the same
+    browser context) -- since the real popup's own top-level document
+    turned out to have zero buttons/download-text and a generic
+    "Hybrid Popup Window" title, meaning the real content lives in a
+    frame, shadow root, or a different context page."""
+
+    def __init__(
+        self,
+        url="https://insight.example.com/vizql/v_test/hybrid-window/min/index.html?id=SECRET123",
+        title="Hybrid Popup Window",
+        frames=None,
+        context_pages=None,
+        title_raises=False,
+        screenshot_raises=False,
+        frames_raise=False,
+        context_raises=False,
+    ):
+        self.url = url
+        self._title = title
+        self._title_raises = title_raises
+        self._frames = frames if frames is not None else []
+        self._frames_raise = frames_raise
+        self.screenshot = MagicMock(
+            side_effect=RuntimeError("screenshot failed") if screenshot_raises else None
+        )
+        if context_raises:
+            self.context = RaisingContext()
+        else:
+            self.context = FakeContext(context_pages if context_pages is not None else [])
+
+    def title(self):
+        if self._title_raises:
+            raise RuntimeError("title failed")
+        return self._title
+
+    @property
+    def frames(self):
+        if self._frames_raise:
+            raise RuntimeError("frames failed")
+        return self._frames
+
+
+def test_debug_dump_view_data_popup_prints_frame_and_context_diagnostics(tmp_path, capsys):
+    main_frame = FakeFrame(
+        url="https://insight.example.com/vizql/v_test/hybrid-window/min/index.html",
+        name="",
+        evaluate_result={
+            "body_inner_html_length": 0,
+            "body_inner_text": "",
+            "buttons": [],
+            "download_elements": [],
+            "iframes": [{"src": "https://insight.example.com/inner?token=SECRET", "name": "inner", "id": "f1"}],
+            "shadow_roots": [],
+            "canvases": [{"width": 800, "height": 600, "client_width": 800, "client_height": 600}],
+            "html_preview": "<html>...</html>",
+        },
+    )
+    other_page = FakeContextPage(
+        url="https://insight.example.com/#/views/ReturnRotate/Dashboard1?:id=1", title="Dashboard"
+    )
+    view_data_page = DebugDumpPage(frames=[main_frame], context_pages=[other_page])
+
+    _debug_dump_view_data_popup(view_data_page, tmp_path)
+
+    view_data_page.screenshot.assert_called_once_with(path=str(tmp_path / "debug_view_data_popup.png"))
+    out = capsys.readouterr().out
+    assert "Hybrid Popup Window" in out
+    assert "popup.frames (1)" in out
+    assert "SECRET" not in out
+    assert "browser context has 1 page(s)" in out
+    assert "Dashboard" in out
+
+
+def test_debug_dump_view_data_popup_never_raises_despite_every_step_failing(tmp_path):
+    view_data_page = DebugDumpPage(
+        title_raises=True,
+        screenshot_raises=True,
+        frames_raise=True,
+        context_raises=True,
+    )
+    _debug_dump_view_data_popup(view_data_page, tmp_path)  # must not raise
+
+
+def test_debug_dump_view_data_popup_reports_per_frame_evaluate_failure(tmp_path, capsys):
+    broken_frame = FakeFrame(evaluate_raises=True)
+    view_data_page = DebugDumpPage(frames=[broken_frame])
+
+    _debug_dump_view_data_popup(view_data_page, tmp_path)  # must not raise
+
+    out = capsys.readouterr().out
+    assert "evaluate() failed" in out
+
+
+class EvaluatePage(FakeEventPage):
+    """Fake supporting a scriptable .evaluate() -- used to test the
+    postMessage/opener/window.name hydration diagnostics, which need a
+    page that can return a specific JS-shaped result rather than the
+    click-oriented ScriptedPage/ViewDataPopupPage fakes."""
+
+    def __init__(self, evaluate_result=None, evaluate_raises=False, on_raises=False):
+        super().__init__(on_raises=on_raises)
+        self._evaluate_result = evaluate_result
+        self._evaluate_raises = evaluate_raises
+
+    def evaluate(self, script):
+        if self._evaluate_raises:
+            raise RuntimeError("evaluate failed")
+        return self._evaluate_result
+
+
+def test_attach_message_listener_never_raises_when_evaluate_fails():
+    page = EvaluatePage(evaluate_raises=True)
+    _attach_message_listener(page)  # must not raise
+
+
+def test_read_hydration_signals_returns_evaluate_result():
+    page = EvaluatePage(evaluate_result={"hasOpener": True, "windowNameLength": 0, "messages": []})
+    signals = _read_hydration_signals(page)
+    assert signals == {"hasOpener": True, "windowNameLength": 0, "messages": []}
+
+
+def test_read_hydration_signals_never_raises_when_evaluate_fails():
+    page = EvaluatePage(evaluate_raises=True)
+    signals = _read_hydration_signals(page)
+    assert "error" in signals
+
+
+def test_debug_dump_hydration_signals_reports_messages_without_leaking_payload(capsys):
+    page = EvaluatePage(
+        evaluate_result={
+            "hasOpener": True,
+            "windowNameLength": 12,
+            "messages": [{"originHost": "insight.example.com", "shape": "object(keys=resultKey,SECRETTOKEN)"}],
+        }
+    )
+    _debug_dump_hydration_signals(page, "test-label")
+    out = capsys.readouterr().out
+    assert "test-label" in out
+    assert "insight.example.com" in out
+    assert "postMessage events observed so far: 1" in out
+
+
+def test_debug_dump_hydration_signals_reports_read_failure(capsys):
+    page = EvaluatePage(evaluate_raises=True)
+    _debug_dump_hydration_signals(page, "test-label")  # must not raise
+    out = capsys.readouterr().out
+    assert "hydration signal read failed" in out
+
+
+def test_attach_popup_runtime_diagnostics_registers_all_listeners():
+    page = FakeEventPage()
+    _attach_popup_runtime_diagnostics(page)
+    assert set(page._handlers.keys()) == {"console", "pageerror", "request", "response"}
+
+
+def test_attach_popup_runtime_diagnostics_never_raises_when_on_fails():
+    page = FakeEventPage(on_raises=True)
+    _attach_popup_runtime_diagnostics(page)  # must not raise
+
+
+def test_attach_popup_runtime_diagnostics_console_and_request_never_print_secrets(capsys):
+    page = FakeEventPage()
+    _attach_popup_runtime_diagnostics(page)
+
+    class FakeConsoleMessage:
+        type = "log"
+        text = "some benign log line"
+
+    class FakeRequest:
+        method = "POST"
+        url = TEMPFILE_URL
+
+    page.fire("console", FakeConsoleMessage())
+    page.fire("request", FakeRequest())
+
+    out = capsys.readouterr().out
+    assert "SESSIONABC" not in out
+    assert "KEY123" not in out
+
+
+def test_describe_locator_returns_evaluate_result():
+    locator = MagicMock()
+    locator.evaluate.return_value = '{"tag": "BUTTON", "text": "Download"}'
+    assert _describe_locator(locator) == '{"tag": "BUTTON", "text": "Download"}'
+
+
+def test_describe_locator_never_raises_when_evaluate_fails():
+    locator = MagicMock()
+    locator.evaluate.side_effect = RuntimeError("boom")
+    result = _describe_locator(locator)
+    assert "description failed" in result
+
+
+def test_generate_export_filename_format():
+    name = generate_export_filename(datetime(2026, 9, 1, 14, 30, 45))
+    assert name == "ReturnRotate_20260901_143045.csv"
+
+
+def test_resolve_headless_defaults_true(monkeypatch):
+    monkeypatch.delenv("HEADLESS", raising=False)
+    assert resolve_headless() is True
+
+
+@pytest.mark.parametrize("value", ["false", "False", "0", "no"])
+def test_resolve_headless_false_variants(monkeypatch, value):
+    monkeypatch.setenv("HEADLESS", value)
+    assert resolve_headless() is False
+
+
+def test_resolve_executable_path_reads_env(monkeypatch):
+    monkeypatch.delenv("PLAYWRIGHT_EXECUTABLE_PATH", raising=False)
+    assert resolve_executable_path() is None
+    monkeypatch.setenv("PLAYWRIGHT_EXECUTABLE_PATH", "/usr/bin/chromium")
+    assert resolve_executable_path() == "/usr/bin/chromium"
+
+
+def test_find_first_returns_first_present_across_candidates():
+    present = FakeLocator()
+    absent = FakeLocator(present=False)
+    result = _find_first([MagicMock()], [lambda s: absent, lambda s: present])
+    assert result is present
+
+
+def test_find_first_returns_none_when_nothing_matches():
+    absent = FakeLocator(present=False)
+    result = _find_first([MagicMock()], [lambda s: absent])
+    assert result is None
+
+
+def test_find_first_swallows_exceptions_from_factories():
+    def bad(_scope):
+        raise RuntimeError("boom")
+
+    present = FakeLocator()
+    result = _find_first([MagicMock()], [bad, lambda s: present])
+    assert result is present
+
+
+class DelayedFieldPage:
+    """Simulates a login form that only appears in the DOM after a
+    couple of polling ticks -- reproduces the actual reported bug: the
+    SPA hadn't finished rendering the login form at the instant the
+    original code checked for it (a single Locator.count() call, which
+    does not wait), so detection silently reported no login form at all
+    and the whole login step was skipped."""
+
+    def __init__(self, appears_after_ticks=2):
+        self._ticks = 0
+        self._appears_after = appears_after_ticks
+        self.frames = []
+        self.password_field = FakeLocator()
+        self.username_field = FakeLocator()
+        self.submit_button = FakeLocator()
+        self.wait_for_timeout = MagicMock(side_effect=self._tick)
+        self.wait_for_load_state = MagicMock()
+        self.goto = MagicMock()
+        self.screenshot = MagicMock()
+
+    def _tick(self, *args, **kwargs):
+        self._ticks += 1
+
+    def _ready(self):
+        return self._ticks >= self._appears_after
+
+    def get_by_label(self, pattern, **kwargs):
+        text = pattern.pattern.lower() if hasattr(pattern, "pattern") else str(pattern).lower()
+        if not self._ready():
+            return FakeLocator(present=False)
+        if "password" in text:
+            return self.password_field
+        if "username" in text:
+            return self.username_field
+        return FakeLocator(present=False)
+
+    def get_by_role(self, role, name=None, **kwargs):
+        if not self._ready() or name is None:
+            return FakeLocator(present=False)
+        text = name.pattern.lower() if hasattr(name, "pattern") else str(name).lower()
+        if "sign" in text:
+            return self.submit_button
+        return FakeLocator(present=False)
+
+    def get_by_text(self, *args, **kwargs):
+        return FakeLocator(present=False)
+
+    def locator(self, *args, **kwargs):
+        return FakeLocator(present=False)
+
+
+def test_login_if_needed_skips_when_no_password_field(monkeypatch):
+    import src.exportbot.browser_crosstab as bc
+
+    monkeypatch.setattr(bc, "LOGIN_DETECT_TIMEOUT_MS", 10)
+    page = ScriptedPage(script=[])
+    _login_if_needed(page, "user", "pass")  # must not raise
+
+
+def test_login_if_needed_fills_and_submits():
+    password_field = FakeLocator()
+    username_field = FakeLocator()
+    submit_button = FakeLocator()
+    page = ScriptedPage(script=[password_field, username_field, submit_button])
+
+    _login_if_needed(page, "the-user", "the-pass")
+
+    username_field.fill.assert_called_once_with("the-user")
+    password_field.fill.assert_called_once_with("the-pass")
+    submit_button.click.assert_called_once()
+
+
+def test_login_if_needed_raises_when_username_field_missing(monkeypatch):
+    import src.exportbot.browser_crosstab as bc
+
+    monkeypatch.setattr(bc, "LOGIN_DETECT_TIMEOUT_MS", 10)
+    password_field = FakeLocator()
+    page = ScriptedPage(script=[password_field])  # username absent
+    with pytest.raises(BrowserAutomationError, match="username field"):
+        _login_if_needed(page, "user", "pass")
+
+
+def test_login_if_needed_never_prints_credentials(capsys):
+    password_field = FakeLocator()
+    username_field = FakeLocator()
+    submit_button = FakeLocator()
+    page = ScriptedPage(script=[password_field, username_field, submit_button])
+
+    _login_if_needed(page, "super-secret-user", "super-secret-pass")
+
+    captured = capsys.readouterr()
+    assert "super-secret-user" not in captured.out
+    assert "super-secret-pass" not in captured.out
+
+
+def test_login_if_needed_waits_for_slow_rendering_login_form():
+    """The actual reported bug: the login form isn't in the DOM yet at
+    the instant of the first check (SPA still rendering). Detection must
+    poll/wait rather than check once, or login gets silently skipped."""
+    page = DelayedFieldPage(appears_after_ticks=2)
+
+    _login_if_needed(page, "the-user", "the-pass")
+
+    page.username_field.fill.assert_called_once_with("the-user")
+    page.password_field.fill.assert_called_once_with("the-pass")
+    page.submit_button.click.assert_called_once()
+
+
+def test_login_if_needed_waits_for_form_to_disappear_after_submit():
+    password_field = FakeLocator()
+    username_field = FakeLocator()
+    submit_button = FakeLocator()
+    page = ScriptedPage(script=[password_field, username_field, submit_button])
+
+    _login_if_needed(page, "user", "pass")
+
+    password_field.wait_for.assert_called_once_with(state="hidden", timeout=20_000)
+
+
+def test_wait_for_dashboard_returns_when_button_present():
+    page = ScriptedPage(script=[FakeLocator()])
+    _wait_for_dashboard(page)  # must not raise
+
+
+def test_wait_for_dashboard_raises_on_timeout(monkeypatch):
+    import src.exportbot.browser_crosstab as bc
+
+    monkeypatch.setattr(bc, "DASHBOARD_LOAD_TIMEOUT_MS", 10)
+    page = ScriptedPage(script=[])  # never present
+    with pytest.raises(BrowserAutomationError, match="Timed out"):
+        _wait_for_dashboard(page)
+
+
+TEMPFILE_URL = (
+    "https://insight.example.com/vizql/w/ReturnRotate/v/Dashboard1"
+    "/tempfile/sessions/SESSIONABC?key=KEY123&keepfile=yes&attachment=yes"
+)
+EXPORT_COMMAND_URL = (
+    "https://insight.example.com/vizql/w/ReturnRotate/v/Dashboard1"
+    "/sessions/SESSIONABC/commands/tabsrv/export-view-data-summary-to-csv-server"
+)
+
+
+def test_capture_tempfile_response_stores_first_matching_response():
+    capture = _TempfileCapture()
+    response = FakeAPIResponse(url=TEMPFILE_URL, headers={"content-type": "text/csv"}, body=b"a,b\n1,2\n")
+
+    _capture_tempfile_response(response, capture)
+
+    assert capture.response is not None
+    assert capture.response.status == 200
+    assert capture.response.headers["content-type"] == "text/csv"
+    assert capture.response.body() == b"a,b\n1,2\n"
+
+
+def test_capture_tempfile_response_ignores_non_tempfile_urls():
+    """The export command's own response (matched by
+    _is_export_related_url() too, for the unrelated diagnostic logger)
+    must NOT be captured as if it were the tempfile -- only the final
+    step actually carries the CSV."""
+    capture = _TempfileCapture()
+    response = FakeAPIResponse(url=EXPORT_COMMAND_URL)
+
+    _capture_tempfile_response(response, capture)
+
+    assert capture.response is None
+
+
+def test_capture_tempfile_response_keeps_first_match_only():
+    capture = _TempfileCapture()
+    first = FakeAPIResponse(url=TEMPFILE_URL, body=b"first")
+    second = FakeAPIResponse(url=TEMPFILE_URL, body=b"second")
+
+    _capture_tempfile_response(first, capture)
+    _capture_tempfile_response(second, capture)
+
+    assert capture.response.body() == b"first"
+
+
+def test_capture_tempfile_response_never_raises_on_unreadable_url():
+    """A response whose very URL can't be read can't be matched, so it
+    isn't captured -- and the handler still must not raise."""
+    capture = _TempfileCapture()
+
+    class BrokenResponse:
+        @property
+        def url(self):
+            raise RuntimeError("boom")
+
+    _capture_tempfile_response(BrokenResponse(), capture)  # must not raise
+    assert capture.response is None
+
+
+def test_capture_tempfile_response_does_not_read_body_inside_the_handler():
+    """Regression test for the real bug that made a live run fail with
+    "Never observed the View Data tempfile response" even though the
+    sibling logger had just printed a successful 200 text/csv tempfile
+    response: the handler used to build an eager status/headers/body
+    snapshot, but Playwright's sync API forbids a browser round-trip
+    (Response.body()) from inside an event handler, and the resulting
+    exception was swallowed by a bare `except: pass`.
+
+    So a response whose body()/status/headers all raise -- exactly what
+    that restriction looks like from inside the handler -- must STILL be
+    captured. The body is read later, on the main flow, where a real
+    failure surfaces as a clear error instead of a silent drop."""
+    capture = _TempfileCapture()
+
+    class HandlerHostileResponse:
+        url = TEMPFILE_URL
+
+        @property
+        def status(self):
+            raise RuntimeError("sync API called from event handler")
+
+        @property
+        def headers(self):
+            raise RuntimeError("sync API called from event handler")
+
+        def body(self):
+            raise RuntimeError("sync API called from event handler")
+
+    response = HandlerHostileResponse()
+    _capture_tempfile_response(response, capture)
+
+    assert capture.response is response
+
+
+def test_wait_for_tempfile_capture_returns_immediately_when_already_captured():
+    capture = _TempfileCapture()
+    capture.response = FakeAPIResponse(url=TEMPFILE_URL)
+    page = ScriptedPage(script=[])
+
+    _wait_for_tempfile_capture(page, capture, 1_000)  # must not raise
+    page.wait_for_timeout.assert_not_called()
+
+
+def test_wait_for_tempfile_capture_raises_on_timeout():
+    capture = _TempfileCapture()  # never populated
+    page = ScriptedPage(script=[])
+
+    with pytest.raises(BrowserAutomationError, match="Never observed the View Data tempfile response"):
+        _wait_for_tempfile_capture(page, capture, 10)
+
+
+def test_attach_export_network_diagnostics_registers_request_and_response_handlers():
+    page = FakeEventPage()
+    _attach_export_network_diagnostics([page])
+    assert set(page._handlers.keys()) == {"request", "response"}
+    assert len(page._handlers["response"]) == 1  # logger only -- no capture given
+
+
+def test_attach_export_network_diagnostics_never_raises_when_on_fails():
+    page = FakeEventPage(on_raises=True)
+    _attach_export_network_diagnostics([page])  # must not raise
+
+
+def test_attach_export_network_diagnostics_also_registers_tempfile_capture_when_given():
+    """The exact mechanism that would have caught the real leak/gap this
+    session found: the diagnostic logger alone was already observing the
+    real tempfile response (confirmed live), but nothing was saving it.
+    This verifies the SAME registered handler set now also populates a
+    given _TempfileCapture when a real network event fires it."""
+    page = FakeEventPage()
+    capture = _TempfileCapture()
+
+    _attach_export_network_diagnostics([page], capture)
+
+    assert len(page._handlers["response"]) == 2  # logger + capturer
+
+    tempfile_response = FakeAPIResponse(url=TEMPFILE_URL, body=b"a,b\n1,2\n")
+    page.fire("response", tempfile_response)
+
+    assert capture.response is not None
+    assert capture.response.body() == b"a,b\n1,2\n"
+
+
+class FakeContextHolder:
+    """A page stand-in exposing only `.context`, for testing
+    _attach_download_capture() without needing a full page fake."""
+
+    def __init__(self, context):
+        self.context = context
+
+
+def test_capture_download_stores_first_event_only():
+    capture = _DownloadCapture()
+    first = MagicMock(name="first-download")
+    second = MagicMock(name="second-download")
+
+    _capture_download(first, capture)
+    _capture_download(second, capture)
+
+    assert capture.download is first
+
+
+def test_attach_download_capture_registers_context_level_listener():
+    context = FakeEventPage()
+    capture = _DownloadCapture()
+
+    _attach_download_capture(FakeContextHolder(context), capture)
+
+    assert len(context._handlers["download"]) == 1
+    download = MagicMock()
+    context.fire("download", download)
+    assert capture.download is download
+
+
+def test_attach_download_capture_never_raises_when_context_missing():
+    class NoContextPage:
+        pass
+
+    _attach_download_capture(NoContextPage(), _DownloadCapture())  # must not raise
+
+
+def test_wait_for_download_capture_returns_immediately_when_already_captured():
+    capture = _DownloadCapture()
+    capture.download = MagicMock()
+    page = ScriptedPage(script=[])
+
+    _wait_for_download_capture(page, capture, 1_000)
+    page.wait_for_timeout.assert_not_called()
+
+
+def test_wait_for_download_capture_gives_up_without_raising_on_timeout():
+    capture = _DownloadCapture()  # never populated
+    page = ScriptedPage(script=[])
+
+    _wait_for_download_capture(page, capture, 10)  # must not raise
+    assert capture.download is None
+
+
+def test_export_crosstab_csv_full_flow_switches_to_full_data_then_captures_tempfile(tmp_path, monkeypatch):
+    """End-to-end through _export_crosstab_csv(): clicking Download ->
+    Data opens the "View Data" popup, which opens on its default
+    "Summary" tab. A HAR capture of the real manual workflow showed two
+    further real clicks are required inside that popup -- "Full Data",
+    then "Download" -- before Tableau's own JS fires the
+    export-view-data-underlying-to-csv-server -> tempfile sequence. This
+    simulates the whole chain: both popup clicks happen, then the
+    tempfile response is fired while _export_crosstab_csv() is polling
+    for it -- exactly what a real Playwright wait_for_timeout() call
+    would dispatch. No "download" event is simulated, so this also
+    covers the response.body() fallback path when Chrome never claims
+    the response as a native download."""
+    import src.exportbot.browser_crosstab as bc
+
+    monkeypatch.setattr(bc, "DOWNLOAD_EVENT_GRACE_PERIOD_MS", 10)
+    download_btn = FakeLocator()
+    data_item = FakeLocator()
+    full_data_tab = FakeLocator()
+    view_data_download_btn = FakeLocator()
+    popup = ViewDataPopupPage(script=[full_data_tab, view_data_download_btn])
+    page = ScriptedPage(script=[download_btn, data_item], popup=popup)
+
+    tempfile_response = FakeAPIResponse(
+        url=TEMPFILE_URL, headers={"content-type": "text/csv"}, body=b"Product,Region\nWidget,East\n"
+    )
+
+    def _fire_tempfile_response_on_poll_tick(*args, **kwargs):
+        popup.fire("response", tempfile_response)
+
+    popup.wait_for_timeout = MagicMock(side_effect=_fire_tempfile_response_on_poll_tick)
+
+    result = _export_crosstab_csv(page, tmp_path)
+
+    download_btn.click.assert_called_once()
+    data_item.click.assert_called_once()
+    full_data_tab.click.assert_called_once()
+    view_data_download_btn.click.assert_called_once()
+    assert result.parent == tmp_path / datetime.now().strftime("%Y-%m-%d")
+    assert result.name.startswith("ReturnRotate_")
+    assert result.read_bytes() == b"Product,Region\nWidget,East\n"
+
+
+def test_export_crosstab_csv_raises_when_tempfile_export_never_observed(tmp_path, monkeypatch):
+    """If the popup's own JS never fires the export after both clicks
+    (e.g. a real behavior change, or a permission/session problem
+    server-side), this must time out into a clear BrowserAutomationError
+    rather than hanging or reporting false success."""
+    import src.exportbot.browser_crosstab as bc
+
+    monkeypatch.setattr(bc, "NETWORK_EXPORT_TIMEOUT_MS", 10)
+    download_btn = FakeLocator()
+    data_item = FakeLocator()
+    full_data_tab = FakeLocator()
+    view_data_download_btn = FakeLocator()
+    popup = ViewDataPopupPage(script=[full_data_tab, view_data_download_btn])
+    page = ScriptedPage(script=[download_btn, data_item], popup=popup)
+
+    with pytest.raises(BrowserAutomationError, match="Never observed the View Data tempfile response"):
+        _export_crosstab_csv(page, tmp_path)
+
+
+def test_export_crosstab_csv_never_prints_secrets_around_tempfile_capture(tmp_path, capsys, monkeypatch):
+    """The [NETDEBUG] lines fired by the diagnostic logger while waiting
+    for the export must never print the real session id or result key --
+    only _redact_url()-redacted URLs. This is what would have caught the
+    real leak found earlier this session (the session id sits in the URL
+    PATH, which _redact_url() did not originally strip)."""
+    import src.exportbot.browser_crosstab as bc
+
+    monkeypatch.setattr(bc, "DOWNLOAD_EVENT_GRACE_PERIOD_MS", 10)
+    download_btn = FakeLocator()
+    data_item = FakeLocator()
+    full_data_tab = FakeLocator()
+    view_data_download_btn = FakeLocator()
+    popup = ViewDataPopupPage(script=[full_data_tab, view_data_download_btn])
+    page = ScriptedPage(script=[download_btn, data_item], popup=popup)
+
+    class FakeRequest:
+        def __init__(self, url, method="POST"):
+            self.url = url
+            self.method = method
+
+    tempfile_response = FakeAPIResponse(
+        url=TEMPFILE_URL, headers={"content-type": "text/csv"}, body=b"Product,Region\nWidget,East\n"
+    )
+
+    def _fire_tempfile_response_on_poll_tick(*args, **kwargs):
+        popup.fire("request", FakeRequest(url=EXPORT_COMMAND_URL))  # exercise the request logger too
+        popup.fire("response", tempfile_response)
+
+    popup.wait_for_timeout = MagicMock(side_effect=_fire_tempfile_response_on_poll_tick)
+
+    _export_crosstab_csv(page, tmp_path)
+
+    out = capsys.readouterr().out
+    assert "SESSIONABC" not in out
+    assert "KEY123" not in out
+
+
+def test_export_crosstab_csv_prefers_downloaded_bytes_over_response_body(tmp_path):
+    """Regression test for the real bug this session found: Chrome's own
+    native download handling can claim the tempfile response (visible in
+    the browser's own "Recent download history"), which makes
+    response.body() return the browser's raw download rather than
+    reliable CSV bytes -- and reproduces the exact symptom this fixes:
+    "it's downloading something, but not a csv file" (a bare GUID
+    filename). Simulates both the tempfile response AND a real
+    Playwright "download" event firing, as a live run showed happens,
+    and confirms the saved file's bytes and name come from the captured
+    download -- not the (deliberately different) response body, and not
+    the browser's meaningless GUID suggested_filename."""
+    download_btn = FakeLocator()
+    data_item = FakeLocator()
+    full_data_tab = FakeLocator()
+    view_data_download_btn = FakeLocator()
+    popup = ViewDataPopupPage(script=[full_data_tab, view_data_download_btn])
+    page = ScriptedPage(script=[download_btn, data_item], popup=popup)
+
+    downloaded_file = tmp_path / "chrome-temp-download"
+    downloaded_file.write_bytes(b"Product,Region\nWidget,East\n")
+    download = FakeDownload(path=str(downloaded_file), suggested_filename="91851309-e8b0-45df-a3d1-510f5503d937")
+
+    tempfile_response = FakeAPIResponse(
+        url=TEMPFILE_URL, headers={"content-type": "text/csv"}, body=b"WRONG IF THIS WERE ACTUALLY READ"
+    )
+
+    def _fire_tempfile_response_and_download_on_poll_tick(*args, **kwargs):
+        popup.fire("response", tempfile_response)
+        page.context.fire("download", download)
+
+    popup.wait_for_timeout = MagicMock(side_effect=_fire_tempfile_response_and_download_on_poll_tick)
+
+    result = _export_crosstab_csv(page, tmp_path / "export")
+
+    assert result.read_bytes() == b"Product,Region\nWidget,East\n"
+    assert result.name.startswith("ReturnRotate_")  # the GUID suggested_filename is rejected
+    assert result.suffix == ".csv"
+
+
+class DelayedViewDataPopupPage:
+    """Simulates the View Data popup's "Full Data" tab only appearing in
+    the DOM after a couple of polling ticks -- mirrors the real,
+    previously-fixed login-form timing bug (DelayedFieldPage above): a
+    one-shot check right after domcontentloaded can false-negative on a
+    popup whose SPA UI hasn't hydrated yet, which is exactly why
+    _switch_to_full_data_and_download() must poll rather than check
+    once."""
+
+    def __init__(self, appears_after_ticks=2):
+        self._ticks = 0
+        self._appears_after = appears_after_ticks
+        self.frames = []
+        self.full_data_tab = FakeLocator()
+        self.download_button = FakeLocator()
+        self.wait_for_timeout = MagicMock(side_effect=self._tick)
+        self.screenshot = MagicMock()
+        self.url = "https://insight.example.com/vizql/w/ReturnRotate/v/Dashboard1/hybrid-window/min/index.html"
+
+    def title(self):
+        return "Hybrid Popup Window"
+
+    def _tick(self, *args, **kwargs):
+        self._ticks += 1
+
+    def _ready(self):
+        return self._ticks >= self._appears_after
+
+    def get_by_role(self, role, name=None, **kwargs):
+        if not self._ready() or name is None:
+            return FakeLocator(present=False)
+        text = name.pattern.lower() if hasattr(name, "pattern") else str(name).lower()
+        if role == "tab" and "full data" in text:
+            return self.full_data_tab
+        if role == "button" and "download" in text:
+            return self.download_button
+        return FakeLocator(present=False)
+
+    def get_by_text(self, *args, **kwargs):
+        return FakeLocator(present=False)
+
+    def locator(self, *args, **kwargs):
+        return FakeLocator(present=False)
+
+
+def test_switch_to_full_data_and_download_waits_for_slow_rendering_popup_ui(tmp_path):
+    """The real-server "0 visible buttons" DOM diagnostic was a one-shot
+    check taken immediately after domcontentloaded -- not proof the
+    popup has no DOM, only that it hadn't hydrated yet at that exact
+    instant (the same bug class as the login-form timing bug). This
+    reproduces that shape: the Full Data tab only becomes findable after
+    a couple of poll ticks."""
+    popup = DelayedViewDataPopupPage(appears_after_ticks=2)
+
+    _switch_to_full_data_and_download(popup, tmp_path)
+
+    popup.full_data_tab.click.assert_called_once()
+    popup.download_button.click.assert_called_once()
+
+
+def test_switch_to_full_data_and_download_clicks_full_data_then_download(tmp_path):
+    """Direct unit test of the click sequence: Full Data must be found
+    and clicked, then Download found and clicked, in that order."""
+    full_data_tab = FakeLocator()
+    download_button = FakeLocator()
+    popup = ViewDataPopupPage(script=[full_data_tab, download_button])
+
+    _switch_to_full_data_and_download(popup, tmp_path)
+
+    full_data_tab.click.assert_called_once()
+    download_button.click.assert_called_once()
+
+
+def test_switch_to_full_data_and_download_never_clicks_download_when_full_data_missing(tmp_path, monkeypatch):
+    """Rejects/avoids the Summary export: if the "Full Data" tab can't be
+    found, Download must never be clicked -- clicking it in that state
+    would silently export Summary instead of failing loudly."""
+    import src.exportbot.browser_crosstab as bc
+
+    monkeypatch.setattr(bc, "VIEW_DATA_POPUP_TIMEOUT_MS", 10)
+    download_button = FakeLocator()
+    # Full Data tab never present (empty script); Download is scripted but
+    # must never actually be reached/clicked.
+    popup = ViewDataPopupPage(script=[])
+
+    with pytest.raises(BrowserAutomationError, match='"Full Data" tab'):
+        _switch_to_full_data_and_download(popup, tmp_path)
+
+    download_button.click.assert_not_called()
+
+
+def test_switch_to_full_data_and_download_raises_when_download_button_missing(tmp_path, monkeypatch):
+    import src.exportbot.browser_crosstab as bc
+
+    monkeypatch.setattr(bc, "VIEW_DATA_POPUP_TIMEOUT_MS", 10)
+    full_data_tab = FakeLocator()
+    popup = ViewDataPopupPage(script=[full_data_tab])  # Download never present
+
+    with pytest.raises(BrowserAutomationError, match='"Download" button'):
+        _switch_to_full_data_and_download(popup, tmp_path)
+
+    full_data_tab.click.assert_called_once()
+
+
+def test_is_export_related_url_matches_command_and_tempfile_only():
+    assert _is_export_related_url(
+        "https://insight.example.com/vizql/w/x/v/y/sessions/1/commands/tabsrv/export-view-data-underlying-to-csv-server"
+    )
+    assert _is_export_related_url(
+        "https://insight.example.com/vizql/w/x/v/y/tempfile/sessions/1?key=abc"
+    )
+    assert not _is_export_related_url("https://insight.example.com/vizql/w/x/v/y/commands/tabdoc/launch-hybrid-view-data-dialog")
+    # The HAR-confirmed Summary command must NOT be treated as the target
+    # export -- getting it means the popup was left on its default tab.
+    assert not _is_export_related_url(
+        "https://insight.example.com/vizql/w/x/v/y/sessions/1/commands/tabsrv/export-view-data-summary-to-csv-server"
+    )
+
+
+def test_extract_filename_from_content_disposition_plain():
+    assert (
+        _extract_filename_from_content_disposition('attachment; filename="Persentase Nasional_data.csv"')
+        == "Persentase Nasional_data.csv"
+    )
+
+
+def test_extract_filename_from_content_disposition_rfc5987():
+    """Regression test for a real bug: the RFC 5987 form is
+    percent-encoded by spec, and a real-server run showed the saved file
+    ending up literally named with `%20` instead of spaces because this
+    wasn't decoded."""
+    assert (
+        _extract_filename_from_content_disposition("attachment; filename*=UTF-8''Persentase%20Nasional_data.csv")
+        == "Persentase Nasional_data.csv"
+    )
+
+
+def test_extract_filename_from_content_disposition_none_when_absent():
+    assert _extract_filename_from_content_disposition(None) is None
+    assert _extract_filename_from_content_disposition("attachment") is None
+
+
+def test_sanitize_filename_strips_path_components_and_hostile_characters():
+    assert _sanitize_filename("../../etc/passwd") == "passwd"
+    assert _sanitize_filename("..\\..\\Windows\\evil.csv") == "evil.csv"
+    assert _sanitize_filename('weird"name?.csv') == "weird_name_.csv"
+
+
+def test_sanitize_filename_returns_none_for_empty_or_missing():
+    assert _sanitize_filename(None) is None
+    assert _sanitize_filename("") is None
+    assert _sanitize_filename("../") is None
+
+
+def test_save_tempfile_response_uses_content_disposition_filename(tmp_path):
+    response = FakeAPIResponse(
+        url="https://insight.example.com/vizql/tempfile/sessions/1?key=abc",
+        headers={"content-type": "text/csv", "content-disposition": 'attachment; filename="Persentase Nasional_data.csv"'},
+        body=b"a,b\n1,2\n",
+    )
+    path = _save_tempfile_response(response, tmp_path, now=datetime(2026, 9, 1, 14, 30, 45))
+    assert path == tmp_path / "2026-09-01" / "Persentase Nasional_data.csv"
+    assert path.read_bytes() == b"a,b\n1,2\n"
+
+
+def test_save_tempfile_response_saves_into_a_date_folder_matching_exporter_convention(tmp_path):
+    """Tableau's own Content-Disposition filename is static (no date), so
+    without a date folder a daily scheduled run would overwrite the
+    previous day's export instead of keeping one file per day -- see
+    exporter.py's identical <export_dir>/<YYYY-MM-DD>/ convention for the
+    REST pipeline."""
+    response = FakeAPIResponse(
+        url="https://insight.example.com/vizql/tempfile/sessions/1?key=abc",
+        headers={"content-type": "text/csv"},
+        body=b"a,b\n1,2\n",
+    )
+    path = _save_tempfile_response(response, tmp_path, now=datetime(2026, 9, 2, 8, 0, 0))
+    assert path.parent.name == "2026-09-02"
+    assert path.parent.parent == tmp_path
+
+
+def test_save_tempfile_response_falls_back_to_generated_filename_without_disposition(tmp_path):
+    response = FakeAPIResponse(
+        url="https://insight.example.com/vizql/tempfile/sessions/1?key=abc",
+        headers={"content-type": "text/csv"},
+    )
+    path = _save_tempfile_response(response, tmp_path, now=datetime(2026, 9, 1, 14, 30, 45))
+    assert path.parent == tmp_path / "2026-09-01"
+    assert path.name.startswith("ReturnRotate_")
+    assert path.name.endswith(".csv")
+
+
+def test_save_tempfile_response_rejects_non_csv_content_type(tmp_path):
+    response = FakeAPIResponse(
+        url="https://insight.example.com/vizql/tempfile/sessions/1?key=abc",
+        headers={"content-type": "application/json"},
+    )
+    with pytest.raises(BrowserAutomationError, match="Content-Type"):
+        _save_tempfile_response(response, tmp_path)
+
+
+def test_save_tempfile_response_rejects_error_status(tmp_path):
+    response = FakeAPIResponse(
+        url="https://insight.example.com/vizql/tempfile/sessions/1?key=abc",
+        status=404,
+    )
+    with pytest.raises(BrowserAutomationError, match="HTTP 404"):
+        _save_tempfile_response(response, tmp_path)
+
+
+def test_save_tempfile_response_reports_a_clear_error_when_body_read_fails(tmp_path):
+    """The body is read on the main flow now, not in the event handler --
+    so if that read genuinely fails, it must surface as a clear error
+    rather than a raw Playwright traceback (or, as before, a silent
+    drop)."""
+
+    class UnreadableBodyResponse(FakeAPIResponse):
+        def body(self):
+            raise RuntimeError("Protocol error: no resource with given identifier")
+
+    response = UnreadableBodyResponse(url=TEMPFILE_URL)
+    with pytest.raises(BrowserAutomationError, match="could not read its body"):
+        _save_tempfile_response(response, tmp_path)
+
+
+class FakeDownload:
+    """Fake for a Playwright Download object -- `.path()` returns a local
+    file (Chrome's own completed download), `.suggested_filename` is
+    whatever name the browser proposed (a real-server run showed this
+    can be a bare GUID with no extension at all)."""
+
+    def __init__(self, path, suggested_filename="download", path_raises=False):
+        self._path = path
+        self.suggested_filename = suggested_filename
+        self._path_raises = path_raises
+
+    def path(self):
+        if self._path_raises:
+            raise RuntimeError("download failed")
+        return self._path
+
+
+def test_save_tempfile_response_prefers_download_bytes_over_response_body(tmp_path):
+    """Regression test for the real bug: once Chrome's own native
+    download handling claims the tempfile response, response.body() can
+    return the wrong (or no) bytes. When a Download was captured, its
+    saved file -- not the response body -- must be the source of
+    truth."""
+    downloaded_file = tmp_path / "chrome-temp-download"
+    downloaded_file.write_bytes(b"Product,Region\nWidget,East\n")
+    download = FakeDownload(path=str(downloaded_file))
+
+    response = FakeAPIResponse(
+        url=TEMPFILE_URL,
+        headers={"content-type": "text/csv"},
+        body=b"THIS WOULD BE WRONG IF ACTUALLY READ",
+    )
+
+    result = _save_tempfile_response(response, tmp_path / "export", download=download)
+
+    assert result.read_bytes() == b"Product,Region\nWidget,East\n"
+
+
+def test_save_tempfile_response_ignores_download_suggested_filename_without_csv_extension(tmp_path):
+    """A real-server run showed the browser's suggested_filename can be a
+    bare GUID with no extension -- that must not be used verbatim; a
+    generated `.csv`-suffixed name is used instead. This is the exact
+    "downloaded something, but not a csv file" symptom being fixed."""
+    downloaded_file = tmp_path / "chrome-temp-download"
+    downloaded_file.write_bytes(b"a,b\n1,2\n")
+    download = FakeDownload(path=str(downloaded_file), suggested_filename="91851309-e8b0-45df-a3d1-510f5503d937")
+
+    response = FakeAPIResponse(url=TEMPFILE_URL, headers={"content-type": "text/csv"})  # no content-disposition
+
+    result = _save_tempfile_response(response, tmp_path / "export", download=download)
+
+    assert result.name.startswith("ReturnRotate_")
+    assert result.suffix == ".csv"
+
+
+def test_save_tempfile_response_uses_download_suggested_filename_when_it_has_csv_extension(tmp_path):
+    downloaded_file = tmp_path / "chrome-temp-download"
+    downloaded_file.write_bytes(b"a,b\n1,2\n")
+    download = FakeDownload(path=str(downloaded_file), suggested_filename="Persentase Nasional_data.csv")
+
+    response = FakeAPIResponse(url=TEMPFILE_URL, headers={"content-type": "text/csv"})
+
+    result = _save_tempfile_response(response, tmp_path / "export", download=download)
+
+    assert result.name == "Persentase Nasional_data.csv"
+
+
+def test_save_tempfile_response_rejects_empty_download(tmp_path):
+    downloaded_file = tmp_path / "chrome-temp-download"
+    downloaded_file.write_bytes(b"")
+    download = FakeDownload(path=str(downloaded_file))
+
+    response = FakeAPIResponse(url=TEMPFILE_URL, headers={"content-type": "text/csv"})
+
+    with pytest.raises(BrowserAutomationError, match="empty"):
+        _save_tempfile_response(response, tmp_path, download=download)
+
+
+def test_save_tempfile_response_reports_clear_error_when_download_path_fails(tmp_path):
+    download = FakeDownload(path=None, path_raises=True)
+    response = FakeAPIResponse(url=TEMPFILE_URL, headers={"content-type": "text/csv"})
+
+    with pytest.raises(BrowserAutomationError, match="could not read its saved file"):
+        _save_tempfile_response(response, tmp_path, download=download)
+
+
+class ReadinessLocator:
+    """A Download-button stand-in whose `title` reports the real
+    "still loading" wording for a few polls, then clears -- mirroring
+    what a live DOM dump showed while the Full Data grid was still
+    fetching rows ("0 rows  0 fields")."""
+
+    def __init__(self, ready_after_reads=2, title_raises=False):
+        self.reads = 0
+        self._ready_after = ready_after_reads
+        self._title_raises = title_raises
+        self.click = MagicMock()
+
+    def get_attribute(self, name):
+        if self._title_raises:
+            raise RuntimeError("no such attribute")
+        self.reads += 1
+        if self.reads <= self._ready_after:
+            return "No column data available to download"
+        return "Download"
+
+
+def test_wait_for_download_button_ready_waits_until_rows_load():
+    page = ScriptedPage(script=[])
+    button = ReadinessLocator(ready_after_reads=2)
+
+    _wait_for_download_button_ready(page, button, 5_000)
+
+    assert button.reads == 3  # polled until the "no column data" title cleared
+    assert page.wait_for_timeout.call_count == 2
+
+
+def test_wait_for_download_button_ready_returns_immediately_when_title_unreadable():
+    """Best-effort by design: if the matched element is the inner label
+    span (no title of its own), don't block the export on a heuristic."""
+    page = ScriptedPage(script=[])
+    button = ReadinessLocator(title_raises=True)
+
+    _wait_for_download_button_ready(page, button, 5_000)
+
+    page.wait_for_timeout.assert_not_called()
+
+
+def test_wait_for_download_button_ready_gives_up_and_proceeds_on_timeout(capsys):
+    """A view that genuinely has no rows must not fail the whole run."""
+    page = ScriptedPage(script=[])
+    button = ReadinessLocator(ready_after_reads=10_000)  # never clears
+
+    _wait_for_download_button_ready(page, button, 10)  # must not raise
+
+    assert "attempting the export anyway" in capsys.readouterr().out
+
+
+def test_run_browser_crosstab_export_orchestrates_and_closes_browser(tmp_path):
+    fake_browser = MagicMock()
+    fake_context = MagicMock()
+    fake_page = MagicMock()
+    fake_context.new_page.return_value = fake_page
+    fake_browser.new_context.return_value = fake_context
+
+    fake_chromium = MagicMock()
+    fake_chromium.launch.return_value = fake_browser
+
+    fake_driver = MagicMock()
+    fake_driver.chromium = fake_chromium
+
+    fake_cm = MagicMock()
+    fake_cm.__enter__.return_value = fake_driver
+    fake_cm.__exit__.return_value = False
+
+    expected_path = tmp_path / "ReturnRotate_20260101_000000.csv"
+
+    with patch("playwright.sync_api.sync_playwright", return_value=fake_cm):
+        with patch("src.exportbot.browser_crosstab._login_if_needed") as mock_login:
+            with patch("src.exportbot.browser_crosstab._wait_for_dashboard") as mock_wait:
+                with patch(
+                    "src.exportbot.browser_crosstab._export_crosstab_csv", return_value=expected_path
+                ) as mock_export:
+                    result = run_browser_crosstab_export(
+                        server_url="https://insight.example.com",
+                        username="user",
+                        password="pass",
+                        export_dir=str(tmp_path),
+                        headless=True,
+                    )
+
+    assert result == expected_path
+    fake_page.goto.assert_any_call(
+        "https://insight.example.com", wait_until="domcontentloaded", timeout=30_000
+    )
+    mock_login.assert_called_once_with(fake_page, "user", "pass")
+    mock_wait.assert_called_once_with(fake_page)
+    mock_export.assert_called_once_with(fake_page, tmp_path)
+    fake_browser.close.assert_called_once()
+    fake_chromium.launch.assert_called_once_with(headless=True)
+
+
+def test_run_browser_crosstab_export_passes_executable_path(tmp_path):
+    fake_browser = MagicMock()
+    fake_context = MagicMock()
+    fake_page = MagicMock()
+    fake_context.new_page.return_value = fake_page
+    fake_browser.new_context.return_value = fake_context
+    fake_chromium = MagicMock()
+    fake_chromium.launch.return_value = fake_browser
+    fake_driver = MagicMock()
+    fake_driver.chromium = fake_chromium
+    fake_cm = MagicMock()
+    fake_cm.__enter__.return_value = fake_driver
+    fake_cm.__exit__.return_value = False
+
+    with patch("playwright.sync_api.sync_playwright", return_value=fake_cm):
+        with patch("src.exportbot.browser_crosstab._login_if_needed"):
+            with patch("src.exportbot.browser_crosstab._wait_for_dashboard"):
+                with patch(
+                    "src.exportbot.browser_crosstab._export_crosstab_csv",
+                    return_value=tmp_path / "x.csv",
+                ):
+                    run_browser_crosstab_export(
+                        server_url="https://insight.example.com",
+                        username="user",
+                        password="pass",
+                        export_dir=str(tmp_path),
+                        headless=False,
+                        executable_path="/usr/bin/chromium-browser",
+                    )
+
+    fake_chromium.launch.assert_called_once_with(
+        headless=False, executable_path="/usr/bin/chromium-browser"
+    )
