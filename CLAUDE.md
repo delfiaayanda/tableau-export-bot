@@ -635,11 +635,115 @@ sharing one deadline, returns `None` on timeout); and the rewritten
 preserved, tempfile response captured and saved, timeout when no
 tempfile response ever arrives, `BrowserAutomationError` when neither
 page has a click target, and the click target found on the main page
-instead of the popup). **This rewrite has not yet been run against the
+instead of the popup).
+
+**A user then ran this against the real server, and the result ruled out
+every DOM-based click entirely** (see "Reproducing the export command
+directly" below): the click-target search above found the *real* main
+dashboard Download button (`#download` /
+`data-tb-test-id="viz-viewer-toolbar-button-download"`, confirmed by
+Playwright resolving the locator), but clicking it while the View Data
+dialog is open hung and timed out -- Tableau's own
+`Dialog-Provider-Dialog-Glass` overlay intentionally blocks the main
+toolbar while a dialog is active, so that click was never going to
+trigger anything. `VIEW_DATA_DOWNLOAD_BUTTON_CANDIDATES`,
+`_find_first_with_wait_across_pages()`, `OVERLAY_SELECTORS`, and
+`_wait_for_overlays_to_clear()` were all removed as a result -- there is
+no DOM click, anywhere, that triggers this export. `_export_from_view_data_popup()`
+was replaced entirely by `_export_view_data_via_vizql_commands()`.
+
+### Reproducing the export command directly -- no click, anywhere
+
+**The two real-server findings above (an entirely empty "View Data"
+popup DOM, and the main dashboard's Download button blocked by
+Tableau's own dialog overlay while that popup is open) rule out every
+DOM-based trigger for the export command.** There is no button, in the
+popup or on the main page, that a real automated click can use. Rather
+than guess at some other UI element (explicitly ruled out), the fix
+reproduces Tableau's own VizQL command flow directly, using the HAR
+capture (see "Native UI Crosstab download" above) as ground truth:
+
+Opening the View Data dialog (the existing "Data" click -- kept, already
+confirmed working) already fires four VizQL commands automatically, with
+**no further click needed**: `launch-hybrid-view-data-dialog`,
+`view-data-dialog-show-aliases`, `get-view-data-csvexport-settings-server`,
+`get-view-data-dialog-tab-pres-model`. Rather than try to trigger the
+fifth command (`export-view-data-summary-to-csv-server`) via some
+unknown UI element, `browser_crosstab.py` now issues it directly:
+
+- `_attach_vizql_bootstrap_listeners()` attaches request/response
+  listeners at the **browser context** level (`page.context.on(...)`),
+  not a specific page -- Playwright's context-level events aggregate
+  traffic from every page in the context, including the "View Data"
+  popup page, which doesn't exist yet at the moment this is attached.
+  This must happen *before* the "Data" click (not after, as the earlier,
+  now-removed network-diagnostic-only version did) since that click is
+  what fires the four bootstrap commands, per the HAR.
+- `_capture_bootstrap_request()` passively pulls the VizQL session id and
+  the workbook/view path prefix (e.g. `w/ReturnRotate/v/Dashboard1`) out
+  of the URL *path* of any of those four commands (every VizQL command
+  URL carries them), and the `X-XSRF-TOKEN` header value out of the
+  request itself -- reusing the exact, already-valid token the browser
+  is already sending, rather than guessing which cookie it's derived
+  from.
+- `_capture_bootstrap_response()` passively searches each bootstrap
+  command's JSON response body for two exact field names confirmed by
+  the HAR -- `visualIdPresModel` and `columns` -- via a generic recursive
+  key search (`_find_key_recursive()`), not a hardcoded nested path,
+  since the real response shape was never captured beyond those field
+  names.
+- Once `_wait_for_view_data_session_capture()` confirms enough context
+  has been observed (polling, no fixed sleep; `columns` is treated as
+  best-effort and not required), `_export_view_data_via_vizql_commands()`
+  POSTs `export-view-data-summary-to-csv-server` and GETs the resulting
+  `tempfile` URL itself, using `page.context.request` -- a Playwright
+  `APIRequestContext` that **automatically reuses the real browser
+  session's cookies** ("The method will populate request cookies from
+  the context", per Playwright's own documentation), with the captured
+  `X-XSRF-TOKEN` set explicitly as a header (the one thing Playwright
+  does not attach automatically). This is a meaningfully different
+  mechanism from the earlier, never-tested `vizql_crosstab_probe.py`
+  module, which used plain `requests` with **no cookies at all** -- a
+  likely reason it was never expected to work against the real server.
+  `resultKey` is pulled from the export response the same
+  generic-recursive-search way. The tempfile response is validated and
+  saved by the existing `_save_tempfile_response()`, unchanged, since
+  Playwright's `APIResponse` and page `Response` objects expose the same
+  `status`/`headers`/`body()` shape.
+- A known, explicit limitation: `columns` is sent as an empty JSON array
+  when it could not be captured. Whether Tableau's server treats that as
+  "all columns" or requires the real list is unverified -- if the real
+  run's exported CSV is missing columns, this is the first place to
+  look.
+
+Login, dashboard navigation, the Download-menu click, the "Data" click,
+popup detection (`page.expect_popup()`), and the still-kept
+`_debug_dump_view_data_popup()` DOM diagnostic are all unchanged. No
+fixed sleeps were added. Regression tests (`tests/test_browser_crosstab.py`)
+cover: `_find_key_recursive()` (nested dict, nested list, not found);
+`_ViewDataSessionCapture.is_complete()` (all core fields required,
+`columns` deliberately not); `_capture_bootstrap_request()` (extracts
+session id/origin/prefix/XSRF token, ignores non-VizQL and
+export/tempfile URLs, never raises when header access fails);
+`_capture_bootstrap_response()` (extracts `visualIdPresModel`/`columns`
+via recursive search, rejects a non-string-list `columns`, never raises
+on an unparseable body); `_attach_vizql_bootstrap_listeners()` (never
+raises when `.on()` fails); `_wait_for_view_data_session_capture()`
+(returns immediately when already complete, raises on timeout); and
+`_export_view_data_via_vizql_commands()` (full success path asserting
+the exact POST/GET calls made and the saved file's contents, plus the
+network-error, non-OK-status, missing-`resultKey`, and
+tempfile-fetch-failure cases) -- plus an updated
+`_export_crosstab_csv()` end-to-end test exercising the whole flow
+through a fake browser context. **This has not yet been run against the
 real server** -- the next real run is what will show whether the
-existing `VIEW_DATA_DOWNLOAD_BUTTON_CANDIDATES` locator actually matches
-something clickable on either page (main or popup) in practice; the
-`[NETDEBUG]` log lines from that run are the next thing to share back.
+captured session context is actually sufficient (right session id,
+right XSRF token, right presModel) to make Tableau accept the export
+command, and whether the empty-`columns` fallback produces a complete
+CSV. The `[NETDEBUG]` log lines from that run (which report only
+booleans -- whether each piece was captured -- and response
+status/Content-Type, never the actual values) are the next thing to
+share back.
 
 ## What is tested vs. not
 
@@ -705,16 +809,24 @@ Tested in this environment (`pytest`, no network):
   credentials never printed, and the slow-rendering-form regression case),
   `_wait_for_dashboard()` (success + timeout), `_export_crosstab_csv()`
   (Download -> Data click sequence, catching the "View Data" popup via a
-  fake `expect_popup()`, the popup-never-opens error path, and
-  debug-screenshot-on-failure), `_export_from_view_data_popup()` --
-  rewritten around network capture (see "Network-based export" above):
-  the overlay-wait-before-click regression cases (overlays clearing
-  normally, a stuck overlay), the tempfile network response being
-  captured and saved, a timeout when no tempfile response ever arrives,
-  raising when neither the popup nor the main dashboard page has a
-  matching click target, and finding the click target on the main page
-  when the popup has none -- each of the failure cases producing a clean
-  `BrowserAutomationError` instead of a raw Playwright traceback,
+  fake `expect_popup()`, the popup-never-opens error path,
+  debug-screenshot-on-failure, and the full flow through to a saved CSV
+  via a fake browser context), `_find_key_recursive()` (nested dict,
+  nested list, not-found), `_ViewDataSessionCapture.is_complete()` (all
+  core fields required, `columns` deliberately not),
+  `_capture_bootstrap_request()` (extracts session id/origin/path-prefix/
+  XSRF token from a real VizQL command URL and its own header, ignores
+  non-VizQL and export/tempfile URLs, never raises when header access
+  fails), `_capture_bootstrap_response()` (extracts `visualIdPresModel`/
+  `columns` via recursive key search, rejects a non-string-list
+  `columns`, never raises on an unparseable body),
+  `_attach_vizql_bootstrap_listeners()` (never raises when `.on()`
+  fails), `_wait_for_view_data_session_capture()` (returns immediately
+  when already complete, raises on timeout),
+  `_export_view_data_via_vizql_commands()` (the full POST
+  export-command -> GET tempfile success path, asserting the exact
+  calls made and the saved file's contents, plus network-error,
+  non-OK-status, missing-`resultKey`, and tempfile-fetch-failure cases),
   `_is_export_related_url()` (matches only the two HAR-confirmed URL
   fragments), `_extract_filename_from_content_disposition()` (plain and
   RFC 5987 forms, absent header), `_sanitize_filename()` (strips path
@@ -723,21 +835,19 @@ Tested in this environment (`pytest`, no network):
   fallback to a generated name, rejects a non-CSV/text Content-Type,
   rejects an HTTP error status), `_attach_export_network_diagnostics()`
   (registers both listeners, never raises when `.on()` fails),
-  `_find_first_with_wait_across_pages()` (finds a match on either page
-  sharing one deadline, returns `None` on timeout), `_redact_url()`
-  (sensitive query-parameter values redacted, non-sensitive ones
-  preserved, never raises on unparseable input), `_inspect_frame()`
-  (returns a frame's `evaluate()` result normally, or `{"error": ...}`
-  without raising when `evaluate()` throws), `_debug_dump_view_data_popup()`
-  (temporary debug-only instrumentation: prints URL/title, per-frame DOM
-  diagnostics -- buttons, Download-text matches, iframes, shadow roots,
-  canvases -- and other browser-context pages, with URLs redacted, saves
-  a screenshot, all independently try/excepted so any single failure
-  here is reported but never blocks the real export), and
-  `run_browser_crosstab_export()`'s orchestration (goto
-  order, browser launch args, browser always closed), all using
-  hand-built fake
-  Playwright-like objects -- no real browser, no real Tableau DOM.
+  `_redact_url()` (sensitive query-parameter values redacted,
+  non-sensitive ones preserved, never raises on unparseable input),
+  `_inspect_frame()` (returns a frame's `evaluate()` result normally, or
+  `{"error": ...}` without raising when `evaluate()` throws),
+  `_debug_dump_view_data_popup()` (temporary debug-only instrumentation,
+  kept unchanged: prints URL/title, per-frame DOM diagnostics -- buttons,
+  Download-text matches, iframes, shadow roots, canvases -- and other
+  browser-context pages, with URLs redacted, saves a screenshot, all
+  independently try/excepted so any single failure here is reported but
+  never blocks the real export), and `run_browser_crosstab_export()`'s
+  orchestration (goto order, browser launch args, browser always
+  closed), all using hand-built fake Playwright-like objects -- no real
+  browser, no real Tableau DOM.
 - `browser_crosstab.py` (CLI) — config-error/success/failure reporting,
   mocking the export function entirely; confirms credentials never
   appear in output.
@@ -749,12 +859,15 @@ automation" above for exactly why):
   live dashboard's real markup — entirely unverified; they're
   best-effort accessible-role/name guesses, not confirmed by inspection.
 - Whether the login form is detected/filled correctly on the real page.
-- Whether the rewritten network-based export (see "Network-based
-  export" above) actually works end to end: whether either page has a
-  clickable `VIEW_DATA_DOWNLOAD_BUTTON_CANDIDATES` match at all, whether
-  clicking it triggers the real `export-view-data-summary-to-csv-server`
-  VizQL command, and whether the resulting `.../tempfile/...` response is
-  observed and captured correctly.
+- Whether the VizQL command reproduction (see "Reproducing the export
+  command directly" above) actually works end to end against the real
+  server: whether the captured session id, `X-XSRF-TOKEN`,
+  `visualIdPresModel`, and origin/path prefix are sufficient for Tableau
+  to accept the `export-view-data-summary-to-csv-server` POST issued via
+  `page.context.request` (as opposed to a real browser-driven request),
+  whether `resultKey` is actually found in its response, whether the
+  `tempfile` GET succeeds, and whether the exported CSV is complete when
+  `columns` could not be captured (sent as an empty list).
 
 Not tested, requires a machine with access to `insight.erajaya.com`:
 - `discover_api_version()` against the real `serverinfo` endpoint (a user

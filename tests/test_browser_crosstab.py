@@ -7,6 +7,7 @@ credential-handling logic is correct. See CLAUDE.md for what remains
 unverified live.
 """
 
+import json
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -14,14 +15,17 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from src.exportbot.browser_crosstab import (
-    OVERLAY_SELECTORS,
+    _ViewDataSessionCapture,
     _attach_export_network_diagnostics,
+    _attach_vizql_bootstrap_listeners,
+    _capture_bootstrap_request,
+    _capture_bootstrap_response,
     _debug_dump_view_data_popup,
     _export_crosstab_csv,
-    _export_from_view_data_popup,
+    _export_view_data_via_vizql_commands,
     _extract_filename_from_content_disposition,
     _find_first,
-    _find_first_with_wait_across_pages,
+    _find_key_recursive,
     _inspect_frame,
     _is_export_related_url,
     _login_if_needed,
@@ -29,6 +33,7 @@ from src.exportbot.browser_crosstab import (
     _sanitize_filename,
     _save_tempfile_response,
     _wait_for_dashboard,
+    _wait_for_view_data_session_capture,
     generate_export_filename,
     resolve_executable_path,
     resolve_headless,
@@ -52,53 +57,99 @@ class FakeLocator:
         return self
 
 
-class FakeResponse:
-    """Fake for a Playwright Response -- stands in for the HAR-confirmed
-    `.../tempfile/...` response that now carries the actual export
-    (a real-server diagnostic showed the "View Data" popup's own DOM has
-    no clickable Download button, so the export is captured over the
-    network instead -- see _save_tempfile_response())."""
+class FakeAPIResponse:
+    """Fake for a Playwright Response/APIResponse -- both share the same
+    shape this module relies on (status/headers/body()/json()/ok), so one
+    fake stands in for the HAR-confirmed `.../tempfile/...` response
+    (consumed by _save_tempfile_response()) and for the
+    export-view-data-summary-to-csv-server response returned by our own
+    `page.context.request.post()` call (consumed directly by
+    _export_view_data_via_vizql_commands())."""
 
-    def __init__(self, url, status=200, headers=None, body=b"Product,Region\nWidget,East\n"):
+    def __init__(self, url, status=200, headers=None, body=b"Product,Region\nWidget,East\n", json_body=None):
         self.url = url
         self.status = status
         self.headers = headers if headers is not None else {"content-type": "text/csv"}
         self._body = body
+        self._json_body = json_body
+
+    @property
+    def ok(self):
+        return self.status < 400
 
     def body(self):
         return self._body
 
-
-class _ResponseEventCM:
-    """Mirrors BrowserContext.expect_event("response", ...): resolves (or
-    times out) when the `with` block exits, matching Playwright's actual
-    behavior for expect_* context managers."""
-
-    def __init__(self, response):
-        self._response = response
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if exc_type is None and self._response is None:
-            raise TimeoutError("Timeout waiting for response event")
-        return False
-
-    @property
-    def value(self):
-        return self._response
+    def json(self):
+        if self._json_body is None:
+            raise ValueError("no JSON body configured on this fake response")
+        return self._json_body
 
 
-class FakeExportContext:
-    """Fake for a BrowserContext, exposing only the one method
-    _export_from_view_data_popup() actually calls on it."""
+class FakeRequest:
+    """Fake for a Playwright Request -- only the pieces
+    _capture_bootstrap_request() reads: .url and the X-XSRF-TOKEN header
+    via .header_value()."""
 
-    def __init__(self, response=None):
-        self._response = response
+    def __init__(self, url, headers=None):
+        self.url = url
+        self._headers = {k.lower(): v for k, v in (headers or {}).items()}
 
-    def expect_event(self, event_name, predicate=None, timeout=None):
-        return _ResponseEventCM(self._response)
+    def header_value(self, name):
+        return self._headers.get(name.lower())
+
+
+class FakeAPIRequestContext:
+    """Fake for Playwright's APIRequestContext (page.context.request) --
+    records every .post()/.get() call (url/headers/multipart/params) for
+    assertions, and returns pre-scripted responses or raises a scripted
+    exception."""
+
+    def __init__(self, post_response=None, get_response=None, post_raises=None, get_raises=None):
+        self.post_calls = []
+        self.get_calls = []
+        self._post_response = post_response
+        self._get_response = get_response
+        self._post_raises = post_raises
+        self._get_raises = get_raises
+
+    def post(self, url, headers=None, multipart=None, timeout=None):
+        self.post_calls.append({"url": url, "headers": headers, "multipart": multipart})
+        if self._post_raises is not None:
+            raise self._post_raises
+        return self._post_response
+
+    def get(self, url, params=None, timeout=None):
+        self.get_calls.append({"url": url, "params": params})
+        if self._get_raises is not None:
+            raise self._get_raises
+        return self._get_response
+
+
+class FakeBrowserContext:
+    """Fake for a Playwright BrowserContext -- exposes `.request` (a
+    FakeAPIRequestContext) and `.on()`. Registering a "request"/"response"
+    handler immediately replays `bootstrap_request`/`bootstrap_response`
+    into it if configured, simulating Tableau's own VizQL bootstrap
+    commands having already fired by the time
+    _attach_vizql_bootstrap_listeners() (called right before the "Data"
+    click, per the module's real ordering requirement) is invoked --
+    exactly the scenario the real HAR shows (the click is itself what
+    fires them)."""
+
+    def __init__(self, request_context=None, bootstrap_request=None, bootstrap_response=None, on_raises=False):
+        self.request = request_context if request_context is not None else FakeAPIRequestContext()
+        self._bootstrap_request = bootstrap_request
+        self._bootstrap_response = bootstrap_response
+        self._on_raises = on_raises
+
+    def on(self, event, handler):
+        if self._on_raises:
+            raise RuntimeError("on() failed")
+        if event == "request" and self._bootstrap_request is not None:
+            handler(self._bootstrap_request)
+        elif event == "response" and self._bootstrap_response is not None:
+            handler(self._bootstrap_response)
 
 
 class _PopupCM:
@@ -129,7 +180,7 @@ class ScriptedPage:
     which candidate in an ordered fallback list "matches" without
     simulating real DOM text matching."""
 
-    def __init__(self, script, popup=None):
+    def __init__(self, script, popup=None, context=None):
         self._script = list(script)
         self._pos = 0
         self.frames = []
@@ -139,6 +190,7 @@ class ScriptedPage:
         self.goto = MagicMock()
         self.screenshot = MagicMock()
         self.on = MagicMock()
+        self.context = context if context is not None else FakeBrowserContext()
 
     def _next(self, *args, **kwargs):
         if self._pos >= len(self._script):
@@ -166,61 +218,26 @@ class ScriptedPage:
 class ViewDataPopupPage:
     """Fake for the "View Data" popup window opened by Download -> Data.
 
-    A real-server diagnostic showed this popup's own DOM has zero visible
-    buttons at all, so the export is now driven via network capture
-    (context.expect_event("response", ...)) instead of a click ->
-    expect_download flow -- see _export_from_view_data_popup(). This fake
-    still exposes a findable button (VIEW_DATA_DOWNLOAD_BUTTON_CANDIDATES'
-    first candidate) since the code still needs *something* to click to
-    trigger the export command, plus a `.context` whose `expect_event()`
-    resolves with `tempfile_response` (a FakeResponse) once that click
-    happens, mirroring how the real tempfile GET fires after the real
-    Download control is clicked."""
+    A real-server diagnostic showed this popup's own DOM is entirely
+    empty (a "Hybrid Popup Window" wrapper) -- see the module docstring
+    in browser_crosstab.py. Its only remaining role is as the polling
+    driver for _wait_for_view_data_session_capture() (.wait_for_timeout)
+    and the target of the still-kept _debug_dump_view_data_popup(); it is
+    never searched for a Download control or clicked any more."""
 
-    def __init__(
-        self,
-        overlay_wait_side_effect=None,
-        tempfile_response=None,
-        button_present=True,
-    ):
+    def __init__(self, url="https://insight.example.com/vizql/w/ReturnRotate/v/Dashboard1/hybrid-window/min/index.html"):
         self.frames = []
-        self.url = "https://insight.example.com/vizql/v_test/hybrid-window/min/index.html"
-        self.download_button = FakeLocator(present=button_present)
+        self.url = url
         self.wait_for_timeout = MagicMock()
         self.wait_for_load_state = MagicMock()
         self.goto = MagicMock()
         self.screenshot = MagicMock()
-        self.on = MagicMock()
-        self.context = FakeExportContext(response=tempfile_response)
 
         def _title():
-            return "View Data: Test Sheet"
+            return "Hybrid Popup Window"
 
         self.title = _title
         self.evaluate = MagicMock(return_value=[])
-
-        self.overlay_locators = {}
-        for selector in OVERLAY_SELECTORS:
-            locator = FakeLocator()
-            if overlay_wait_side_effect is not None:
-                locator.wait_for = MagicMock(side_effect=overlay_wait_side_effect)
-            self.overlay_locators[selector] = locator
-
-    def get_by_role(self, role, name=None, **kwargs):
-        if name is not None:
-            return self.download_button
-        return FakeLocator(present=False)
-
-    def get_by_text(self, *args, **kwargs):
-        return FakeLocator(present=False)
-
-    def get_by_label(self, *args, **kwargs):
-        return FakeLocator(present=False)
-
-    def locator(self, selector, **kwargs):
-        if selector in self.overlay_locators:
-            return self.overlay_locators[selector]
-        return FakeLocator(present=False)
 
 
 def test_redact_url_redacts_sensitive_params_but_keeps_others():
@@ -568,28 +585,77 @@ def test_wait_for_dashboard_raises_on_timeout(monkeypatch):
         _wait_for_dashboard(page)
 
 
-def test_export_crosstab_csv_full_flow_saves_file_via_network_response(tmp_path):
-    """End-to-end through both _export_crosstab_csv() and
-    _export_from_view_data_popup(): clicking Download -> Data opens a
-    separate "View Data" popup page, and the actual CSV export is now
-    captured via the HAR-confirmed tempfile network response rather than
-    a DOM download button or Playwright's `download` event -- a
-    real-server diagnostic found the popup's own DOM has zero buttons at
-    all (see CLAUDE.md, "Network-based export")."""
+BOOTSTRAP_URL = (
+    "https://insight.example.com/vizql/w/ReturnRotate/v/Dashboard1"
+    "/sessions/SESSIONABC/commands/tabdoc/launch-hybrid-view-data-dialog"
+)
+EXPORT_COMMAND_URL = (
+    "https://insight.example.com/vizql/w/ReturnRotate/v/Dashboard1"
+    "/sessions/SESSIONABC/commands/tabsrv/export-view-data-summary-to-csv-server"
+)
+TEMPFILE_URL = "https://insight.example.com/vizql/w/ReturnRotate/v/Dashboard1/tempfile/sessions/SESSIONABC"
+
+
+def _make_completed_capture(**overrides):
+    capture = _ViewDataSessionCapture()
+    capture.origin = "https://insight.example.com"
+    capture.command_path_prefix = "w/ReturnRotate/v/Dashboard1"
+    capture.session_id = "SESSIONABC"
+    capture.visual_id_pres_model = "visual-abc"
+    capture.xsrf_token = "xsrf-value-123"
+    capture.columns = ["Product", "Region"]
+    for key, value in overrides.items():
+        setattr(capture, key, value)
+    return capture
+
+
+def test_export_crosstab_csv_full_flow_reproduces_vizql_export_commands(tmp_path):
+    """End-to-end through _export_crosstab_csv(): clicking Download ->
+    Data opens the "View Data" popup (kept, confirmed working against
+    the real server), but the CSV export itself is now reproduced by
+    issuing Tableau's own VizQL commands directly -- see the module
+    docstring in browser_crosstab.py for why every DOM-based approach
+    (the popup's own empty DOM, the main dashboard's Download button
+    blocked by Tableau's own dialog-glass overlay) was ruled out."""
     download_btn = FakeLocator()
     data_item = FakeLocator()
-    tempfile_response = FakeResponse(
-        url="https://insight.example.com/vizql/w_test/v_test/tempfile/sessions/abc?key=xyz",
+    popup = ViewDataPopupPage()
+
+    bootstrap_request = FakeRequest(url=BOOTSTRAP_URL, headers={"x-xsrf-token": "xsrf-value-123"})
+    bootstrap_response = FakeAPIResponse(
+        url=BOOTSTRAP_URL,
+        json_body={"nested": {"visualIdPresModel": "visual-abc", "columns": ["Product", "Region"]}},
+    )
+    export_response = FakeAPIResponse(url=EXPORT_COMMAND_URL, json_body={"resultKey": "KEY123"})
+    tempfile_response = FakeAPIResponse(
+        url=TEMPFILE_URL,
+        headers={"content-type": "text/csv"},
         body=b"Product,Region\nWidget,East\n",
     )
-    popup = ViewDataPopupPage(tempfile_response=tempfile_response)
-    page = ScriptedPage(script=[download_btn, data_item], popup=popup)
+    request_ctx = FakeAPIRequestContext(post_response=export_response, get_response=tempfile_response)
+    context = FakeBrowserContext(
+        request_context=request_ctx,
+        bootstrap_request=bootstrap_request,
+        bootstrap_response=bootstrap_response,
+    )
+    page = ScriptedPage(script=[download_btn, data_item], popup=popup, context=context)
 
     result = _export_crosstab_csv(page, tmp_path)
 
     download_btn.click.assert_called_once()
     data_item.click.assert_called_once()
-    popup.download_button.click.assert_called_once()
+
+    assert len(request_ctx.post_calls) == 1
+    post_call = request_ctx.post_calls[0]
+    assert post_call["url"] == EXPORT_COMMAND_URL
+    assert post_call["headers"]["X-XSRF-TOKEN"] == "xsrf-value-123"
+    assert post_call["multipart"]["visualIdPresModel"] == "visual-abc"
+    assert json.loads(post_call["multipart"]["columns"]) == ["Product", "Region"]
+
+    assert len(request_ctx.get_calls) == 1
+    get_call = request_ctx.get_calls[0]
+    assert get_call["url"] == TEMPFILE_URL
+    assert get_call["params"]["key"] == "KEY123"
 
     assert result.parent == tmp_path
     assert result.name.startswith("ReturnRotate_")
@@ -624,100 +690,199 @@ def test_export_crosstab_csv_raises_when_view_data_popup_does_not_open(tmp_path)
     page.screenshot.assert_called_once()
 
 
-def test_export_from_view_data_popup_waits_for_overlays_before_click(tmp_path):
-    """Reproduces the real reported bug: the popup's Download button is
-    visible/enabled/stable but a Tableau glass-pane/dialog overlay
-    intercepts pointer events, so Playwright's click() retries and times
-    out. The fix must explicitly wait for each known overlay to clear
-    (via Locator.wait_for(state="hidden")) before attempting the click."""
-    tempfile_response = FakeResponse(
-        url="https://insight.example.com/vizql/tempfile/sessions/abc?key=xyz"
+def test_find_key_recursive_finds_nested_dict_key():
+    obj = {"a": {"b": {"visualIdPresModel": "visual-xyz"}}}
+    assert _find_key_recursive(obj, "visualIdPresModel") == "visual-xyz"
+
+
+def test_find_key_recursive_finds_key_inside_list():
+    obj = {"notifications": [{"other": 1}, {"columns": ["A", "B"]}]}
+    assert _find_key_recursive(obj, "columns") == ["A", "B"]
+
+
+def test_find_key_recursive_returns_none_when_absent():
+    assert _find_key_recursive({"a": {"b": 1}}, "missing") is None
+    assert _find_key_recursive("not a container", "missing") is None
+
+
+def test_view_data_session_capture_is_complete_requires_core_fields_but_not_columns():
+    capture = _ViewDataSessionCapture()
+    assert not capture.is_complete()
+
+    capture.origin = "https://insight.example.com"
+    capture.command_path_prefix = "w/ReturnRotate/v/Dashboard1"
+    capture.session_id = "SESSIONABC"
+    capture.xsrf_token = "token"
+    assert not capture.is_complete()  # visual_id_pres_model still missing
+
+    capture.visual_id_pres_model = "visual-abc"
+    assert capture.is_complete()  # columns deliberately not required
+
+
+def test_capture_bootstrap_request_extracts_session_context_and_xsrf_token():
+    capture = _ViewDataSessionCapture()
+    request = FakeRequest(url=BOOTSTRAP_URL, headers={"x-xsrf-token": "the-real-token"})
+
+    _capture_bootstrap_request(request, capture)
+
+    assert capture.origin == "https://insight.example.com"
+    assert capture.command_path_prefix == "w/ReturnRotate/v/Dashboard1"
+    assert capture.session_id == "SESSIONABC"
+    assert capture.xsrf_token == "the-real-token"
+
+
+def test_capture_bootstrap_request_ignores_non_vizql_command_urls():
+    capture = _ViewDataSessionCapture()
+    request = FakeRequest(url="https://insight.example.com/some/other/api", headers={"x-xsrf-token": "t"})
+
+    _capture_bootstrap_request(request, capture)
+
+    assert capture.session_id is None
+
+
+def test_capture_bootstrap_request_ignores_export_and_tempfile_urls():
+    """These are the calls _export_view_data_via_vizql_commands() issues
+    itself -- they must not be (re-)captured as if they were bootstrap
+    commands."""
+    capture = _ViewDataSessionCapture()
+    _capture_bootstrap_request(FakeRequest(url=EXPORT_COMMAND_URL, headers={"x-xsrf-token": "t"}), capture)
+    _capture_bootstrap_request(FakeRequest(url=TEMPFILE_URL, headers={"x-xsrf-token": "t"}), capture)
+
+    assert capture.session_id is None
+
+
+def test_capture_bootstrap_request_never_raises_when_header_value_fails():
+    class BrokenRequest:
+        url = BOOTSTRAP_URL
+
+        def header_value(self, name):
+            raise RuntimeError("boom")
+
+    capture = _ViewDataSessionCapture()
+    _capture_bootstrap_request(BrokenRequest(), capture)  # must not raise
+    assert capture.session_id == "SESSIONABC"  # URL-derived fields still captured
+    assert capture.xsrf_token is None
+
+
+def test_capture_bootstrap_response_extracts_pres_model_and_columns():
+    capture = _ViewDataSessionCapture()
+    response = FakeAPIResponse(
+        url=BOOTSTRAP_URL,
+        json_body={"deeply": {"nested": {"visualIdPresModel": "visual-abc", "columns": ["Product", "Region"]}}},
     )
-    popup = ViewDataPopupPage(tempfile_response=tempfile_response)  # overlays resolve immediately
+
+    _capture_bootstrap_response(response, capture)
+
+    assert capture.visual_id_pres_model == "visual-abc"
+    assert capture.columns == ["Product", "Region"]
+
+
+def test_capture_bootstrap_response_ignores_non_string_list_columns():
+    capture = _ViewDataSessionCapture()
+    response = FakeAPIResponse(url=BOOTSTRAP_URL, json_body={"columns": [1, 2, 3]})
+
+    _capture_bootstrap_response(response, capture)
+
+    assert capture.columns is None
+
+
+def test_capture_bootstrap_response_never_raises_when_body_is_not_json():
+    capture = _ViewDataSessionCapture()
+    response = FakeAPIResponse(url=BOOTSTRAP_URL, json_body=None)  # .json() raises ValueError
+
+    _capture_bootstrap_response(response, capture)  # must not raise
+    assert capture.visual_id_pres_model is None
+
+
+def test_attach_vizql_bootstrap_listeners_registers_both_handlers():
+    context = FakeBrowserContext()
+    capture = _ViewDataSessionCapture()
+
+    _attach_vizql_bootstrap_listeners(context, capture)  # must not raise
+
+
+def test_attach_vizql_bootstrap_listeners_never_raises_when_on_fails():
+    context = FakeBrowserContext(on_raises=True)
+    capture = _ViewDataSessionCapture()
+
+    _attach_vizql_bootstrap_listeners(context, capture)  # must not raise
+
+
+def test_wait_for_view_data_session_capture_returns_immediately_when_already_complete():
+    capture = _make_completed_capture()
     page = ScriptedPage(script=[])
 
-    result = _export_from_view_data_popup(page, popup, tmp_path)
-
-    for selector in OVERLAY_SELECTORS:
-        popup.overlay_locators[selector].wait_for.assert_called_once_with(
-            state="hidden", timeout=30_000
-        )
-    popup.download_button.click.assert_called_once()
-    assert result.name.startswith("ReturnRotate_")
-    assert result.read_bytes() == b"Product,Region\nWidget,East\n"
+    _wait_for_view_data_session_capture(page, capture, 1_000)  # must not raise
+    page.wait_for_timeout.assert_not_called()
 
 
-def test_export_from_view_data_popup_raises_and_screenshots_when_overlay_never_clears(tmp_path):
-    """If an overlay genuinely never clears (real stuck-dialog case), the
-    raw Playwright TimeoutError must not leak out uncaught -- it should
-    be turned into a clear BrowserAutomationError with a debug
-    screenshot, same as every other failure mode in this module."""
-
-    def always_times_out(*args, **kwargs):
-        raise TimeoutError("Timeout 30000ms exceeded waiting for element to be hidden")
-
-    popup = ViewDataPopupPage(overlay_wait_side_effect=always_times_out)
+def test_wait_for_view_data_session_capture_raises_on_timeout():
+    capture = _ViewDataSessionCapture()  # never completes
     page = ScriptedPage(script=[])
 
-    with pytest.raises(BrowserAutomationError, match="Could not export CSV from the View Data window"):
-        _export_from_view_data_popup(page, popup, tmp_path)
-
-    popup.download_button.click.assert_not_called()
-    popup.screenshot.assert_called_once()
+    with pytest.raises(BrowserAutomationError, match="Timed out waiting to observe"):
+        _wait_for_view_data_session_capture(page, capture, 10)
 
 
-def test_export_from_view_data_popup_raises_when_tempfile_response_never_observed(tmp_path):
-    """If the click happens but no matching tempfile response ever fires
-    (e.g. the export command failed silently, or the trigger wasn't
-    actually the right control), the network wait must time out into a
-    clear BrowserAutomationError rather than hanging or reporting false
-    success."""
-    popup = ViewDataPopupPage(tempfile_response=None)
-    page = ScriptedPage(script=[])
-
-    with pytest.raises(BrowserAutomationError, match="Could not export CSV from the View Data window"):
-        _export_from_view_data_popup(page, popup, tmp_path)
-
-    popup.download_button.click.assert_called_once()
-    popup.screenshot.assert_called_once()
-
-
-def test_export_from_view_data_popup_raises_when_no_download_control_on_either_page(monkeypatch, tmp_path):
-    """A real-server diagnostic showed the popup's own DOM has no
-    Download control at all, so the search now also covers the main
-    dashboard page (the "parent page owns the real UI" hypothesis). If
-    neither page has a match, this must raise rather than guess a new
-    selector."""
-    import src.exportbot.browser_crosstab as bc
-
-    monkeypatch.setattr(bc, "DASHBOARD_LOAD_TIMEOUT_MS", 10)
-    popup = ViewDataPopupPage(button_present=False)
-    page = ScriptedPage(script=[])  # main page also has no matching control
-
-    with pytest.raises(BrowserAutomationError, match='"Download" control'):
-        _export_from_view_data_popup(page, popup, tmp_path)
-    popup.screenshot.assert_called_once()
-
-
-def test_export_from_view_data_popup_finds_download_control_on_main_page(monkeypatch, tmp_path):
-    """Covers the "parent page owns the real UI" hypothesis directly: the
-    popup has no matching control, but the main dashboard page does --
-    the broadened, shared-deadline search must find and click it there."""
-    import src.exportbot.browser_crosstab as bc
-
-    monkeypatch.setattr(bc, "DASHBOARD_LOAD_TIMEOUT_MS", 10)
-    tempfile_response = FakeResponse(
-        url="https://insight.example.com/vizql/tempfile/sessions/abc?key=xyz"
+def test_export_view_data_via_vizql_commands_success(tmp_path):
+    capture = _make_completed_capture()
+    export_response = FakeAPIResponse(url=EXPORT_COMMAND_URL, json_body={"resultKey": "KEY123"})
+    tempfile_response = FakeAPIResponse(
+        url=TEMPFILE_URL, headers={"content-type": "text/csv"}, body=b"a,b\n1,2\n"
     )
-    popup = ViewDataPopupPage(tempfile_response=tempfile_response, button_present=False)
-    main_page_button = FakeLocator()
-    page = ScriptedPage(script=[main_page_button])
+    request_ctx = FakeAPIRequestContext(post_response=export_response, get_response=tempfile_response)
+    page = ScriptedPage(script=[], context=FakeBrowserContext(request_context=request_ctx))
+    popup = ViewDataPopupPage()
 
-    result = _export_from_view_data_popup(page, popup, tmp_path)
+    result = _export_view_data_via_vizql_commands(page, popup, capture, tmp_path)
 
-    main_page_button.click.assert_called_once()
-    popup.download_button.click.assert_not_called()
-    assert result.name.startswith("ReturnRotate_")
+    assert request_ctx.post_calls[0]["url"] == EXPORT_COMMAND_URL
+    assert request_ctx.get_calls[0]["url"] == TEMPFILE_URL
+    assert result.read_bytes() == b"a,b\n1,2\n"
+
+
+def test_export_view_data_via_vizql_commands_raises_when_post_fails(tmp_path):
+    capture = _make_completed_capture()
+    request_ctx = FakeAPIRequestContext(post_raises=RuntimeError("network error"))
+    page = ScriptedPage(script=[], context=FakeBrowserContext(request_context=request_ctx))
+    popup = ViewDataPopupPage()
+
+    with pytest.raises(BrowserAutomationError, match="Could not issue the View Data export command"):
+        _export_view_data_via_vizql_commands(page, popup, capture, tmp_path)
+    popup.screenshot.assert_called_once()
+
+
+def test_export_view_data_via_vizql_commands_raises_on_non_ok_status(tmp_path):
+    capture = _make_completed_capture()
+    export_response = FakeAPIResponse(url=EXPORT_COMMAND_URL, status=500, json_body={})
+    request_ctx = FakeAPIRequestContext(post_response=export_response)
+    page = ScriptedPage(script=[], context=FakeBrowserContext(request_context=request_ctx))
+    popup = ViewDataPopupPage()
+
+    with pytest.raises(BrowserAutomationError, match="HTTP 500"):
+        _export_view_data_via_vizql_commands(page, popup, capture, tmp_path)
+
+
+def test_export_view_data_via_vizql_commands_raises_when_result_key_missing(tmp_path):
+    capture = _make_completed_capture()
+    export_response = FakeAPIResponse(url=EXPORT_COMMAND_URL, json_body={"nothing": "here"})
+    request_ctx = FakeAPIRequestContext(post_response=export_response)
+    page = ScriptedPage(script=[], context=FakeBrowserContext(request_context=request_ctx))
+    popup = ViewDataPopupPage()
+
+    with pytest.raises(BrowserAutomationError, match="no resultKey was found"):
+        _export_view_data_via_vizql_commands(page, popup, capture, tmp_path)
+
+
+def test_export_view_data_via_vizql_commands_raises_when_tempfile_fetch_fails(tmp_path):
+    capture = _make_completed_capture()
+    export_response = FakeAPIResponse(url=EXPORT_COMMAND_URL, json_body={"resultKey": "KEY123"})
+    request_ctx = FakeAPIRequestContext(post_response=export_response, get_raises=RuntimeError("network error"))
+    page = ScriptedPage(script=[], context=FakeBrowserContext(request_context=request_ctx))
+    popup = ViewDataPopupPage()
+
+    with pytest.raises(BrowserAutomationError, match="Could not fetch the exported tempfile"):
+        _export_view_data_via_vizql_commands(page, popup, capture, tmp_path)
 
 
 def test_is_export_related_url_matches_command_and_tempfile_only():
@@ -762,7 +927,7 @@ def test_sanitize_filename_returns_none_for_empty_or_missing():
 
 
 def test_save_tempfile_response_uses_content_disposition_filename(tmp_path):
-    response = FakeResponse(
+    response = FakeAPIResponse(
         url="https://insight.example.com/vizql/tempfile/sessions/1?key=abc",
         headers={"content-type": "text/csv", "content-disposition": 'attachment; filename="Persentase Nasional_data.csv"'},
         body=b"a,b\n1,2\n",
@@ -773,7 +938,7 @@ def test_save_tempfile_response_uses_content_disposition_filename(tmp_path):
 
 
 def test_save_tempfile_response_falls_back_to_generated_filename_without_disposition(tmp_path):
-    response = FakeResponse(
+    response = FakeAPIResponse(
         url="https://insight.example.com/vizql/tempfile/sessions/1?key=abc",
         headers={"content-type": "text/csv"},
     )
@@ -784,7 +949,7 @@ def test_save_tempfile_response_falls_back_to_generated_filename_without_disposi
 
 
 def test_save_tempfile_response_rejects_non_csv_content_type(tmp_path):
-    response = FakeResponse(
+    response = FakeAPIResponse(
         url="https://insight.example.com/vizql/tempfile/sessions/1?key=abc",
         headers={"content-type": "application/json"},
     )
@@ -793,7 +958,7 @@ def test_save_tempfile_response_rejects_non_csv_content_type(tmp_path):
 
 
 def test_save_tempfile_response_rejects_error_status(tmp_path):
-    response = FakeResponse(
+    response = FakeAPIResponse(
         url="https://insight.example.com/vizql/tempfile/sessions/1?key=abc",
         status=404,
     )
@@ -825,27 +990,6 @@ def test_attach_export_network_diagnostics_registers_request_and_response_handle
 def test_attach_export_network_diagnostics_never_raises_when_on_fails():
     page = FakeNetworkPage(on_raises=True)
     _attach_export_network_diagnostics([page])  # must not raise
-
-
-def test_find_first_with_wait_across_pages_checks_both_pages_before_timing_out():
-    absent_a = FakeLocator(present=False)
-    absent_b = FakeLocator(present=False)
-    present = FakeLocator()
-    page_a = ScriptedPage(script=[absent_a])
-    page_b = ScriptedPage(script=[absent_b, present])
-
-    result = _find_first_with_wait_across_pages([page_a, page_b], [lambda s: s.get_by_role("button")], 1_000)
-
-    assert result is present
-
-
-def test_find_first_with_wait_across_pages_returns_none_on_timeout():
-    page_a = ScriptedPage(script=[])
-    page_b = ScriptedPage(script=[])
-
-    result = _find_first_with_wait_across_pages([page_a, page_b], [lambda s: s.get_by_role("button")], 10)
-
-    assert result is None
 
 
 def test_run_browser_crosstab_export_orchestrates_and_closes_browser(tmp_path):
