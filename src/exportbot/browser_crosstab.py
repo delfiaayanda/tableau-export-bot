@@ -167,7 +167,7 @@ import re
 import time
 import uuid
 from pathlib import Path
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 from .exceptions import BrowserAutomationError
 
@@ -784,14 +784,24 @@ def _extract_filename_from_content_disposition(content_disposition: str | None) 
     `filename=` or RFC 5987 `filename*=`). This is response metadata, not
     file contents, so it's safe to use -- but it's still attacker/
     server-controlled, so the caller must sanitize it before treating it
-    as a filesystem path (see _sanitize_filename)."""
+    as a filesystem path (see _sanitize_filename).
+
+    The RFC 5987 `filename*=` form is percent-encoded by spec (e.g.
+    `UTF-8''Persentase%20Nasional_data.csv`) -- a real-server run showed
+    the saved file ending up literally named with `%20` in place of
+    spaces because this wasn't being decoded. `unquote()`d here, after
+    stripping the `UTF-8''` charset/language prefix."""
     if not content_disposition:
         return None
     for part in content_disposition.split(";"):
         part = part.strip()
         if part.lower().startswith("filename*="):
             value = part.split("=", 1)[1]
-            return value.split("''", 1)[-1].strip('"')
+            value = value.split("''", 1)[-1].strip('"')
+            try:
+                return unquote(value)
+            except Exception:
+                return value
         if part.lower().startswith("filename="):
             return part.split("=", 1)[1].strip('"')
     return None

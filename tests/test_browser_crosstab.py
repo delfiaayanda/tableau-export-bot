@@ -1158,9 +1158,13 @@ def test_extract_filename_from_content_disposition_plain():
 
 
 def test_extract_filename_from_content_disposition_rfc5987():
+    """Regression test for a real bug: the RFC 5987 form is
+    percent-encoded by spec, and a real-server run showed the saved file
+    ending up literally named with `%20` instead of spaces because this
+    wasn't decoded."""
     assert (
         _extract_filename_from_content_disposition("attachment; filename*=UTF-8''Persentase%20Nasional_data.csv")
-        == "Persentase%20Nasional_data.csv"
+        == "Persentase Nasional_data.csv"
     )
 
 

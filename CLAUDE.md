@@ -1396,6 +1396,41 @@ passed. **Not yet run against the real server** -- the next run is what
 will show whether the saved file is finally a real, correctly-named CSV
 with the full Full Data row count.
 
+### Success -- end-to-end export confirmed, one cosmetic filename bug fixed
+
+**A user ran `browser_crosstab.py` and it worked end to end**: login,
+dashboard, popup, Full Data click, Download click, the real
+`export-view-data-underlying-to-csv-server` + tempfile pair (both HTTP
+200), a `[NETDEBUG] captured a browser download event`, and finally:
+
+```
+Saved exports\Persentase%20Nasional_Full%20Data_data.csv (76070210 bytes)
+SUCCESS: exports\Persentase%20Nasional_Full%20Data_data.csv
+```
+
+76 MB -- consistent with the earlier 72.5 MB seen in Chrome's own
+download history for the same export, confirming this is genuinely the
+full underlying dataset, not a truncated or wrong file. **This is the
+first fully successful real-server run of the whole pipeline.**
+
+The one visible issue was cosmetic: the saved filename contained literal
+`%20` instead of spaces. Root cause: `_extract_filename_from_content_disposition()`'s
+RFC 5987 `filename*=UTF-8''...` branch (the form Tableau's own tempfile
+response uses) is percent-encoded by spec, but the code was never
+calling `unquote()` on it -- it had been taking the encoded value
+verbatim since this function was first written, and the existing test
+`test_extract_filename_from_content_disposition_rfc5987` had pinned that
+buggy behavior as correct rather than catching it (asserting the `%20`
+in its expected output). Fixed by decoding with `urllib.parse.unquote()`
+after stripping the `UTF-8''` charset/language prefix; the test now
+asserts the decoded value (`"Persentase Nasional_data.csv"`). Full
+suite: 159 passed.
+
+**Next**: confirm the corrected code produces a real-spaces filename on
+the next run, and spot-check the CSV's row count against what the "View
+Data" popup showed ("200 rows" was only the on-screen preview cap, not
+necessarily the full underlying row count).
+
 ## What is tested vs. not
 
 Tested in this environment (`pytest`, no network):
