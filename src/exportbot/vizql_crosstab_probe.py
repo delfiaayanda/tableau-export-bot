@@ -55,6 +55,7 @@ from __future__ import annotations
 import time
 import uuid
 from dataclasses import dataclass
+from urllib.parse import unquote
 
 import requests
 
@@ -105,8 +106,15 @@ def _extract_filename(content_disposition: str | None) -> str | None:
     for part in content_disposition.split(";"):
         part = part.strip()
         if part.lower().startswith("filename*="):
+            # RFC 5987 `filename*=UTF-8''...` is percent-encoded by spec;
+            # decode it after stripping the charset/language prefix so the
+            # filename doesn't end up literally containing `%20` etc.
             value = part.split("=", 1)[1]
-            return value.split("''", 1)[-1].strip('"')
+            value = value.split("''", 1)[-1].strip('"')
+            try:
+                return unquote(value)
+            except Exception:
+                return value
         if part.lower().startswith("filename="):
             return part.split("=", 1)[1].strip('"')
     return None
