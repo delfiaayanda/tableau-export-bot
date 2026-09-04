@@ -147,7 +147,8 @@ def test_fetch_tempfile_reports_metadata_and_uses_result_key_as_query_param():
         result = fetch_tempfile(_ctx(), FAKE_RESULT_KEY)
 
     assert result.status_code == 200
-    assert result.filename == "Persentase%20Nasional_data.csv"
+    # RFC 5987 `filename*=` is percent-encoded; it should be decoded.
+    assert result.filename == "Persentase Nasional_data.csv"
     assert result.response_size_bytes == len(b"col_a,col_b\nvalue1,value2\n")
     assert "value1" not in str(result)  # row values never surfaced
 
